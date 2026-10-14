@@ -1,6 +1,6 @@
 {
   "name": "logical-projects",
-  "version": "2.0.2",
+  "version": "2.1.1",
   "description": "Portfolio layer for Claude Code: generated project index plus per-project narrative pages.",
   "type": "module",
   "private": true,

@@ -34,7 +34,8 @@ overrides that reference. A new name adds to the set.
 
 - `config.json` sets `dir`, `firesAt` (0.8), `writeBar` (0.85), `maxInject` (6), `shortlist` (30)
   and `ledger`. The runbooks folder is `RUNBOOKS_DIR`, then `dir`, then `docs/runbooks/` at the
-  git top, then `~/docs/runbooks/`, skipping any that do not exist.
+  git top, then `~/docs/runbooks/`, skipping any that do not exist. A `dir` from `~/.runbooks/`
+  ranks below another repo's own `docs/runbooks/`. A worktree of home counts as home.
 - `nudges/<name>.mjs` exports `fn({ root, dir, entries })`, which returns a string or null for a
   session-start line, under a 1.2 second deadline.
 - `lint/<name>.mjs` exports `fn({ slug, text, header })`, which returns a list of violation

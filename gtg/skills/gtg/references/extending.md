@@ -67,6 +67,17 @@ On the forge store, `file` is `null` in both hooks. A throwing hook is reported 
 
 Before a hook runs, the CLI has already appended what the machine knows to the handoff body: a `## Task list` read from the harness's task store (Claude Code: `<config dir>/tasks/<session id>/`), and, for a project in its own worktree, `## Commits this session` and `## Files touched` from its git log since the session started. A body that already carries a section of the same name keeps its own.
 
+`gtg refresh` and `gtg migrate <device>` write a handoff and then open a T3 Code thread that resumes it. They read two more files:
+
+```
+.gtg/t3-servers.json      # { "<device>": { "home": "<workspace root>" } }, migrate's targets
+.gtg/t3-launch.mjs        # default export fn(ctx), opens the thread
+```
+
+The launcher's `ctx` is `{ root, target, slug, name, verb, done }`. `verb` is `refresh` or `migrate <device>`, and `done` is `REFRESHED` or `MIGRATED`. It opens a T3 thread on `target` whose first message is `gtg <slug>` and returns one line starting with `done`, which the CLI prints in place of `RESUME:`. Anything else it returns is a failure. A throw is a failure too, and its message reaches the user next to the saved handoff, so put advice in it, such as what to do when the device is offline. Other keys in a device's `t3-servers.json` entry are yours for the launcher to read.
+
+Without a launcher, the CLI prints a `GTG-LAUNCH:` line naming T3's own MCP calls instead, `mcp__t3-code__t3_thread_launch` for a refresh and the target's `mcp__t3-<device>__` tools for a migrate, and the agent makes them. Only a session inside T3 has those tools, so with no launcher both verbs refuse, before writing anything, unless the session looks like T3: `T3CODE_CLI_PATH` (set by T3's desktop app) or `T3_ACP_MCP_NODE`. A headless `t3 serve` sets neither, so set `GTG_T3=1` there.
+
 There are no markdown hooks. `.gtg/skill/on-exit.md` and `on-resume.md` were removed because checking for one cost a tool turn every time, and anything they did is either mechanical (belongs in the script) or already in the handoff body.
 
 ## Resolution and stability
@@ -106,6 +117,8 @@ The `-text` lines in `.gitattributes` (see the README) are correctness, not tidi
 | `file` | auto | path to the handoff document. Absent on the forge store |
 | `updated` | auto | last checkpoint timestamp. Never triggers automatic shelving |
 | `reviewed` | `gtg keep` | when a `REVIEW:` question was answered "still live". Kept apart from `updated` so "Nd ago" stays honest |
+| `resumedAt` | `gtg resume` | when a session last picked the entry up, written at most once a day. The review counts it as touched, `list`'s "Nd ago" does not |
+| `nudged` | the `REVIEW:` line | when the review last asked about the entry. No session asks about it again for 30 days |
 | `wake` | `gtg back --wake`, `gtg keep --wake` | backlog only: the date the entry comes back up for review |
 
 A `phase` key on entries written before 1.3.0 is ignored on read and never rewritten. `sessions` and `created` backfill from the handoff files already on disk, so no migration is needed.

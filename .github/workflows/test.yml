@@ -14,14 +14,22 @@ jobs:
       - run: node --test lib-cli/test/*.test.mjs
       - run: node --test scripts/*.test.mjs
       # Globs, not a hand list. The list missed 6 of 9 gtg files and the projects store test.
-      # The shell expands the glob (Node 20 has no --test glob support). gtg runs one file at a
-      # time because gtg.test.mjs spawns the CLI against many temp repos (gtg/package.json).
-      - run: node --test --test-concurrency=1 gtg/test/*.test.mjs
+      # The shell expands the glob (Node 20 has no --test glob support). gtg's CLI cases are split
+      # across gtg-part*.test.mjs so its files run side by side (gtg/package.json).
+      - run: node --test gtg/test/*.test.mjs
       - run: node --test logical-projects/test/*.test.mjs
       # Learn's write-failure test uses a read-only sprint file. Its writer checks the mode
       # explicitly because Forgejo's ubuntu-latest runner may execute as root.
       - run: node logical-learning/test/learn.test.mjs
       - run: node --test runbooks/test/*.test.mjs
+      # The public release leaves opencode/ out (.public-exclude), so GitHub skips this step.
+      - name: OpenCode native parity
+        run: |
+          if [ ! -d opencode ]; then echo "no opencode/ in this tree"; exit 0; fi
+          npm ci --prefix opencode --ignore-scripts
+          npm rebuild --prefix opencode better-sqlite3
+          node opencode/compat/context-mode-1.0.169.mjs
+          node --test opencode/test/*.test.mjs
       # Offline: every model call is a stubbed fetch and jevmail's postman call is injected.
       - run: node --test jevtools/skills/jevchecker/*.test.mjs
       - run: node --test jevtools/scripts/*.test.mjs
@@ -29,21 +37,17 @@ jobs:
         if: github.server_url == 'https://github.com'
         with:
           python-version: '3.12'
-      # Both runners. Forgejo's node:22-bookworm image has python3 but no `python` and no
-      # pip, and its Python is externally managed (PEP 668), so there pip comes from apt
-      # and installs with --break-system-packages. The container is thrown away after.
+      # Both runners load the pinned pure-Python wheels directly with zipimport.
+      # Forgejo's node:22-bookworm has python3 but no `python` or pip. No installer,
+      # package-index access or change to its externally managed Python is needed.
       - shell: bash
         run: |
           command -v python >/dev/null || ln -s "$(command -v python3)" /usr/local/bin/python
-          if python -m pip --version >/dev/null 2>&1; then
-            python -m pip install -q -r postman/skills/postman/requirements.txt
-          else
-            apt-get update -qq && apt-get install -y -qq --no-install-recommends python3-pip >/dev/null
-            python -m pip install -q --break-system-packages -r postman/skills/postman/requirements.txt
-          fi
-      # Network-tolerant by construction: the batch tests stub has_mx, and the one real
-      # lookup asserts a nonexistent host resolves False, which is also what any resolver
-      # failure returns. So this passes on a runner with no DNS egress.
+          export PYTHONPATH="$PWD/postman/skills/postman/wheels/markdown-3.11-py3-none-any.whl:$PWD/postman/skills/postman/wheels/dnspython-2.8.0-py3-none-any.whl"
+          python -c "import markdown, dns.resolver"
+          printf 'PYTHONPATH=%s\n' "$PYTHONPATH" >> "$GITHUB_ENV"
+      # Offline: batch tests stub has_mx; the resolver tests inject DNS outcomes,
+      # including transient failures returning None (unknown), which still blocks mail.
       # cwd-independent: fixture_home() points POSTMAN_HOME at a tempdir for the whole run,
       # the example config resolves from __file__, and Python puts the script's own
       # directory on sys.path[0]. Verified from the repo root and from the skill directory.

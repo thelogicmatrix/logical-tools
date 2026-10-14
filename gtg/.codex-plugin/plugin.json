@@ -1,6 +1,6 @@
 {
   "name": "gtg",
-  "version": "4.4.2",
+  "version": "4.9.1",
   "description": "Todo list and handoffs for AI. Say 'gtg' and the agent writes a handoff a fresh session can resume from. Say 'gtg <project>' next time and it carries on from the next action. Extend it with your own subcommands and after-handoff steps in .gtg/.",
   "author": { "name": "Nathan Wong" },
   "skills": "./skills/",

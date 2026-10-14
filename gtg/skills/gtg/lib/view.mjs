@@ -27,6 +27,10 @@ const EXTENSION_PARENTS = new Set(Object.values(EXTENSIONS));
 export const isExtensionEntry = (e) => EXTENSION_PARENTS.has(e?.parent);
 export const userVisible = (arr) => arr.filter((e) => !isExtensionEntry(e));
 
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+// "2026-10-14T18:00" -> "14 Oct 18:00", "2026-10-14" -> "14 Oct".
+export const dueLabel = (v) => `${Number(v.slice(8, 10))} ${MONTHS[Number(v.slice(5, 7)) - 1]}${v.length > 10 ? ' ' + v.slice(11, 16) : ''}`;
+
 // --- color (TTY-gated, NO_COLOR-aware; raw ANSI, no dependency) ---------------
 const COLOR = process.stdout.isTTY && !process.env.NO_COLOR;
 export const c = (code, s) => (COLOR ? `\x1b[${code}m${s}\x1b[0m` : String(s));
@@ -188,7 +192,7 @@ export function renderList(argv, ctx) {
     const loc = e.branch && e.branch !== '?' ? c('2', ` ${e.branch}`) : '';
     const sessions = e.sessions ?? ctx.countHandoffFiles(e.slug); // legacy entries predate the field
     const by = e.harness ? c('2', ` ·${e.harness}`) : ''; // who wrote the last handoff; absent on pre-1.11 entries
-    console.log(`  ${label} ${c('1;36', e.project)} ${c('2', 's' + sessions)} [${c('32', e.eta || '?')}] ${c('2', '(' + ago(e.updated) + ')')}${by}${loc}${dirtyTag}`);
+    console.log(`  ${label} ${c('1;36', e.project)} ${c('2', 's' + sessions)} [${c('32', e.eta || '?')}]${e.due ? ' ' + c('35', 'due ' + dueLabel(e.due)) : ''} ${c('2', '(' + ago(e.updated) + ')')}${by}${loc}${dirtyTag}`);
     console.log(`     → ${e.next}`);
   };
 
@@ -238,37 +242,55 @@ export function renderList(argv, ctx) {
 // a parked entry never comes back by itself. Every command that reads or moves entries ends
 // with at most ONE question, so the check rides on gtg use in any harness rather than on a
 // session-start banner, which T3 Code and IDE threads never reliably see. `keep` answers
-// "still live" and restarts that entry's clock without pretending it was worked on.
+// "still live" and restarts that entry's clock without pretending it was worked on. A resume
+// counts as touching the entry (`resumedAt`), so a project picked up today is not called stale.
+// A question asked is stamped on the record (`nudged`), and every session and device reads that
+// stamp, so the same entry is asked about at most once per REVIEW_REPEAT_DAYS (asked for 2026-10-09).
 export const REVIEW_ACTIVE_DAYS = 5;
-export const REVIEW_BACKLOG_DAYS = 14;
+export const REVIEW_BACKLOG_DAYS = 30;
+export const REVIEW_REPEAT_DAYS = 30;
 export const REVIEW_CMDS = new Set(['handoff', 'list', 'backlog', 'resume', 'back', 'active', 'complete', 'remove', 'rm', 'prune', 'keep', 'supersede']);
+const days = (iso, now) => (now - (Date.parse(iso) || 0)) / 864e5;
+// Days until `e` can be asked about again because of its last question, 0 when it is free.
+export const repeatWait = (e, now = Date.now()) => Math.max(0, Math.ceil(REVIEW_REPEAT_DAYS - days(e.nudged, now)));
 // Priority: a backlog entry whose wake date has come, then the stalest active entry, then the
 // stalest undated backlog entry. A future wake date keeps an entry out of the review entirely.
-export function reviewCandidate(ctx, now = Date.now()) {
-  const seen = (e) => Math.max(Date.parse(e.updated) || 0, Date.parse(e.reviewed) || 0);
+// Returns { line, which, slug } or null.
+export function reviewPick(ctx, now = Date.now()) {
+  const seen = (e) => Math.max(Date.parse(e.updated) || 0, Date.parse(e.reviewed) || 0, Date.parse(e.resumedAt) || 0);
   const age = (e) => Math.floor((now - seen(e)) / 864e5);
   const oldest = (arr) => arr.sort((x, y) => seen(x) - seen(y))[0];
   const today = nowIso().slice(0, 10);
-  const bl = userVisible(ctx.entries('backlog')).filter((e) => e.slug !== ctx.skip);
-  const act = userVisible(ctx.entries('active')).filter((e) => e.slug !== ctx.skip);
+  const open = (e) => e.slug !== ctx.skip && !repeatWait(e, now);
+  const bl = userVisible(ctx.entries('backlog')).filter(open);
+  const act = userVisible(ctx.entries('active')).filter(open);
+  const pick = (e, which, line) => ({ line, which, slug: e.slug });
   const woke = bl.filter((e) => e.wake && e.wake <= today).sort((x, y) => x.wake.localeCompare(y.wake))[0];
-  if (woke) return `REVIEW: ${woke.project} [${woke.slug}] was parked until ${woke.wake}. Ask the user: pick it up (gtg active ${woke.slug}), done (gtg complete ${woke.slug}), or park again (gtg keep ${woke.slug} --wake YYYY-MM-DD).`;
+  if (woke) return pick(woke, 'backlog', `REVIEW: ${woke.project} [${woke.slug}] was parked until ${woke.wake}. Ask the user: pick it up (gtg active ${woke.slug}), done (gtg complete ${woke.slug}), or park again (gtg keep ${woke.slug} --wake YYYY-MM-DD).`);
   const a = oldest(act.filter((e) => age(e) >= REVIEW_ACTIVE_DAYS));
-  if (a) return `REVIEW: ${a.project} [${a.slug}] untouched ${age(a)}d. Ask the user: done (gtg complete ${a.slug}), shelve (gtg back ${a.slug} [--wake YYYY-MM-DD]), or still live (gtg keep ${a.slug}).`;
+  if (a) return pick(a, 'active', `REVIEW: ${a.project} [${a.slug}] untouched ${age(a)}d. Ask the user: done (gtg complete ${a.slug}), shelve (gtg back ${a.slug} [--wake YYYY-MM-DD]), or still live (gtg keep ${a.slug}).`);
   const b = oldest(bl.filter((e) => !e.wake && age(e) >= REVIEW_BACKLOG_DAYS));
-  if (b) return `REVIEW: ${b.project} [${b.slug}] parked ${age(b)}d. Ask the user: done (gtg complete ${b.slug}), or still wanted (gtg keep ${b.slug} [--wake YYYY-MM-DD]).`;
+  if (b) return pick(b, 'backlog', `REVIEW: ${b.project} [${b.slug}] parked ${age(b)}d. Ask the user: done (gtg complete ${b.slug}), or still wanted (gtg keep ${b.slug} [--wake YYYY-MM-DD]).`);
   return null;
 }
+export const reviewCandidate = (ctx, now = Date.now()) => reviewPick(ctx, now)?.line ?? null;
 
-// Quiet for a filtered list (SKILL.md's slug-reuse probe) and for an in-session checkpoint.
-export function printReview(cmd, argv, ctx) {
+// Picks the question and has ctx.stampNudged record it, before the store is flushed, so the stamp
+// rides in the same write. Returns the line for the caller to print last. Quiet for a filtered list
+// (SKILL.md's slug-reuse probe) and for an in-session checkpoint.
+export function takeReview(cmd, argv, ctx) {
   const a = parseFlags(argv);
-  if (cmd === 'list' && argv.some((x) => !x.startsWith('--'))) return;
-  if (cmd === 'handoff' && a.checkpoint) return;
+  if (cmd === 'list' && argv.some((x) => !x.startsWith('--'))) return null;
+  if (cmd === 'handoff' && a.checkpoint) return null;
   try {
-    const line = reviewCandidate(ctx);
-    if (line) console.log(line);
+    const p = reviewPick(ctx);
+    if (!p) return null;
+    try { ctx.stampNudged?.(p.which, p.slug); } catch (e) {
+      console.error(`gtg: review not recorded, it may be asked again - ${firstMeaningfulLine(e)}`);
+    }
+    return p.line;
   } catch (e) {
     console.error(`gtg: review skipped - ${firstMeaningfulLine(e)}`); // never fails the command it rides on
+    return null;
   }
 }

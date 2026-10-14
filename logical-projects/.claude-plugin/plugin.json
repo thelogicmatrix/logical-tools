@@ -1,6 +1,6 @@
 {
   "name": "logical-projects",
-  "version": "2.0.2",
+  "version": "2.1.1",
   "description": "Basic project tracking. A generated index of every project and one page each, and a sync that checks both against the repos so the table never quietly goes stale.",
   "author": { "name": "Nathan Wong" }
 }

@@ -4,7 +4,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { resumeConsume, syncHub, syncTarget } from '../skills/gtg/lib/resume.mjs';
 
@@ -74,7 +74,7 @@ function fixture({ active, backlog = [], forge = null, command = () => false } =
   const calls = { list: 0, picked: [] };
   const ctx = {
     root, forge, entries: (w) => (w === 'active' ? active : backlog), commandFileFor: command,
-    readStore: () => null, writeStore: () => {}, commit: () => true,
+    readStore: () => null, writeStore: () => {}, saveEntries: () => [], commit: () => true,
     listAll: () => { calls.list += 1; }, onPick: (slug) => calls.picked.push(slug),
   };
   return { root, ctx, calls };
@@ -138,4 +138,50 @@ test('resumeConsume runs the after-resume hook with its ctx, and a failing hook 
     assert.equal(r.err, 'gtg: after-resume hook failed - hook broke');
     assert.equal(process.exitCode, 1);
   } finally { process.exitCode = saved; }
+});
+
+// 2026-10-02: a handoff written on the desktop named a worktree only that machine had, a session on
+// the laptop resumed it, and only found out when a `cd` failed. Resume now says so on the line after RESUME, naming the
+// device that wrote it when the record carries one, and stays quiet when the path is here.
+test('resumeConsume warns when the handoff worktree is not on this device', async () => {
+  const here = hostname().toLowerCase();
+  const gone = join(tmp, 'no-such-worktree');
+  const line = (o) => {
+    const f = fixture({ active: [e({ project: 'Meld', slug: 'meld', ...o })] });
+    return run(() => resumeConsume(['meld'], f.ctx)).then((r) => r.out.split('\n')[1]);
+  };
+  assert.equal(await line({ worktree: gone, device: 'desk-pc' }),
+    `Worktree ${gone} is not on this device (${here}). The handoff was written on desk-pc.`);
+  assert.equal(await line({ worktree: gone }), `Worktree ${gone} is not on this device (${here}).`,
+    'an old record with no device warns on the missing path alone');
+  assert.equal(await line({ worktree: gone, device: here }), `Worktree ${gone} is not on this device (${here}).`,
+    'written here and since removed: naming this device twice says nothing');
+  const quiet = (o) => line(o).then((l) => assert.doesNotMatch(l ?? '', /is not on this device/, JSON.stringify(o)));
+  await quiet({ worktree: tmp, device: 'desk-pc' });
+  await quiet({ worktree: 'repo root', device: 'desk-pc' });
+  await quiet({ device: 'desk-pc' });
+});
+
+// The forge holds the records and handoffs, but the hub's own git still carries what resume reads
+// after them: the progress record, which supersedes the handoff snapshot, and the portfolio rows the
+// after-resume hook flips. Skipping the sync on the forge store left those as stale as the last
+// scheduled pull, so a resume could print an older progress snapshot over a newer handoff.
+test('resumeConsume fast-forwards the hub on the forge store too', () => {
+  const upstream = repo('forge-upstream');
+  git(upstream, 'commit', '-q', '--allow-empty', '-m', 'one');
+  const hub = join(tmp, 'forge-hub');
+  execFileSync('git', ['clone', '-q', upstream, hub]);
+  git(upstream, 'commit', '-q', '--allow-empty', '-m', 'progress from the other machine');
+  const tip = git(upstream, 'rev-parse', 'HEAD');
+  const mod = new URL('../skills/gtg/lib/resume.mjs', import.meta.url).href;
+  const code = `const { resumeConsume } = await import(${JSON.stringify(mod)});
+    const rec = { project: 'Solo', slug: 'solo', next: 'n', updated: '2026-09-01T10:30:00+08:00' };
+    await resumeConsume(['solo'], { root: ${JSON.stringify(hub)}, entries: (w) => (w === 'active' ? [rec] : []),
+      forge: { latestHandoff: async () => 'forge body', locationOf: () => 'forge:solo' },
+      commandFileFor: () => false, listAll() {}, onPick() {}, readStore: () => null, writeStore() {}, commit: () => true });`;
+  const env = { ...process.env };
+  delete env.GTG_NO_SYNC;
+  const out = execFileSync(process.execPath, ['--input-type=module', '-e', code], { env, encoding: 'utf8' });
+  assert.match(out, new RegExp(`^Synced origin/main: fast-forwarded to ${tip.slice(0, 7)}\nRESUME: "Solo"`));
+  assert.equal(git(hub, 'rev-parse', 'HEAD'), tip);
 });

@@ -38,8 +38,8 @@ The working directory itself does not matter: the imports resolve relative to th
 path to `jevchecker.mjs` runs from anywhere. What matters is where the skill sits in the tree, which
 the paragraph below states.
 
-A sweep with a model check needs `OPENROUTER_API_KEY` in the environment, or that key in
-`~/.jev.env`. With neither it prints one line and exits 1 before spending anything. A regex-only
+A sweep with a model check needs `OPENROUTER_KEY_JEVTOOLS` (or the fallback `OPENROUTER_API_KEY`) in
+the environment or in `~/.jev.env`. With neither it prints one line and exits 1 before spending anything. A regex-only
 sweep makes no call and needs no key.
 
 It imports `../../scripts/lib.mjs` inside the jevtools plugin. Copy the skill to a

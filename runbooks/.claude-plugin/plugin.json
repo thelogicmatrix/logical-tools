@@ -1,6 +1,6 @@
 {
   "name": "runbooks",
-  "version": "1.4.3",
+  "version": "1.4.6",
   "description": "Immediate intelligent context injection. Short files of procedures, rules and lookup tables. On every prompt a cheap model picks the ones that apply and points the agent to them before it answers. Extend it with thresholds, lint rules and session-start lines in .runbooks/.",
   "author": { "name": "Nathan Wong" }
 }

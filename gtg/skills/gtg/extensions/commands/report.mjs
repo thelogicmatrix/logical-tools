@@ -14,5 +14,5 @@ export default ({ root, args }) => {
   console.log(out);
   const t = report.throughput;
   console.log(`gtg report: ${report.counts.active} active · ${t.shipped} shipped · ` +
-    `${report.effort.sessionsTimed} sessions timed · ${report.historyAvailable ? 'history ok' : 'no git history'}`);
+    `${report.effort.available ? report.effort.sessionsTimed + ' sessions timed' : 'effort unavailable'} · ${report.historyAvailable ? 'history ok' : 'no git history'}`);
 };

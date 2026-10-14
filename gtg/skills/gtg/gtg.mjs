@@ -2,19 +2,22 @@
 // gtg - zero-model bookkeeping CLI for the gtg pause/resume skill.
 // Storage root: GTG_HUB env var if set, else the current git repo's root.
 // Unknown subcommands dispatch to <root>/.gtg/commands/<name>.mjs (see README).
-import { readFileSync, writeFileSync, existsSync, mkdirSync, rmSync, readdirSync, renameSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, rmSync, readdirSync, renameSync, realpathSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { join, dirname, resolve } from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import { readCollection, writeCollection } from './lib/store.mjs';
 import { runGit, firstMeaningfulLine } from './lib/git.mjs';
-import { gitTop } from './lib/root.mjs';
+import { gitTop, configuredRoot } from './lib/root.mjs';
 import { isMain } from './lib/exit.mjs';
 import { forgeConfig, openForge } from './lib/forge.mjs';
 import { readProgress, renderProgress, renderProgressTaskList } from './lib/progress.mjs';
-import { EXTENSIONS, REVIEW_ACTIVE_DAYS, REVIEW_BACKLOG_DAYS, REVIEW_CMDS, ago, c, displayOrder, localOffsetSuffix, nowIso,
-  parseFlags, printReview as printReviewFor, renderList as renderListFor, resolveEntry, sortByProject, userVisible } from './lib/view.mjs';
-import { resumeConsume as resumeFor } from './lib/resume.mjs';
+import { EXTENSIONS, REVIEW_ACTIVE_DAYS, REVIEW_BACKLOG_DAYS, REVIEW_CMDS, ago, c, displayOrder, dueLabel, localOffsetSuffix, nowIso,
+  parseFlags, renderList as renderListFor, repeatWait, takeReview as takeReviewFor, resolveEntry, sortByProject, userVisible } from './lib/view.mjs';
+import { resumeConsume as resumeFor, thisDevice } from './lib/resume.mjs';
+import { addUpNext, upNextItems, setUpNext, setSection } from './lib/upnext.mjs';
+import { NEEDS_T3, canOpenThread, loadServers, openThread } from './lib/move.mjs';
 
 // --- storage root -----------------------------------------------------------
 // The repo the caller stands in, or null outside one. Looked up once: startup needs it for ROOT
@@ -89,7 +92,7 @@ function detectHarness() {
 // The remaining internal callers read _session.json, which is a genuine single-object file.
 //
 // So the shape contract is real but has no bundled caller left to enforce it. A third-party
-// extension in .gtg/commands/ is now the caller that depends on it, and test/gtg.test.mjs
+// extension in .gtg/commands/ is now the caller that depends on it, and test/gtg-part6.test.mjs
 // case 72 is what holds it - keep that case if you touch this function.
 function readStore(rel) {
   const p = join(ROOT, rel);
@@ -180,7 +183,7 @@ function saveEntries(which, items) {
 //   - the `RESUME_PATH && MIGRATION_PENDING` sync that had to run BEFORE the shard commit, or
 //     the two machines each committed their own shard over the same records and every later
 //     cross-machine handoff needed a human to resolve the fork. The sync that matters is still
-//     there, in resumeConsume, ahead of every read - see syncHub() and gtg.test.mjs case 73.
+//     there, in resumeConsume, ahead of every read - see syncHub() and gtg-part6.test.mjs case 73.
 //   - the per-collection catch that kept a corrupt packed file from taking gtg down entirely.
 //     readCollection now throws per RECORD instead, which is the same protection one level
 //     down: one unparseable record names itself rather than emptying a list.
@@ -238,7 +241,7 @@ function firstHandoffDate(slug) {
 // parent just lists the project as standalone.
 function inferParent(slug, explicit) {
   if (explicit) return explicit;
-  const idx = join(ROOT, 'docs/projects/INDEX.md');
+  const idx = join(configuredRoot('PROJECTS_ROOT') || ROOT, 'docs/projects/INDEX.md');
   if (!existsSync(idx)) return undefined;
   let text;
   try { text = readFileSync(idx, 'utf8'); } catch { return undefined; }
@@ -278,13 +281,21 @@ function sessionStartIso() {
   const iso = s?.sessions?.[process.cwd()];
   return Number.isFinite(Date.parse(iso ?? '')) ? iso : undefined;
 }
-// Case-insensitive on Windows, where the hub env var and git's own path spelling differ.
+// Case-insensitive on Windows, where the hub env var and git's own path spelling differ. Real paths,
+// because git reports a junctioned hub (a Windows profile reached through a junction) by its target. A path that is
+// gone falls back to resolve().
 function samePath(x, y) {
-  const n = (s) => (process.platform === 'win32' ? resolve(s).toLowerCase() : resolve(s));
+  const real = (s) => { try { return realpathSync.native(s); } catch { return resolve(s); } };
+  const n = (s) => (process.platform === 'win32' ? real(s).toLowerCase() : real(s));
   return n(x) === n(y);
 }
-// The repo the caller stands in, unless that repo is the hub itself.
+// The caller's checkout is the project's worktree only when the hub is a checkout's top, as home
+// is. An agent hub (ATOM's /state/atom, or ~/.atom inside home) is not, and before 4.8.0 any repo
+// a command ran in counted as its worktree, so the handoff carried that repo's commits and files
+// (an ATOM probe on 2026-10-12 got 40 lines of home's history).
 function inferWorktree() {
+  const hubTop = gitTop(ROOT);
+  if (!hubTop || !samePath(hubTop, ROOT)) return 'repo root';
   const top = callerRepo();
   return top && !samePath(top, ROOT) ? top : 'repo root';
 }
@@ -333,8 +344,8 @@ function gitSince(dir, sinceIso) {
 }
 
 // --- handoff / backlog park ---------------------------------------------------
-async function writeHandoff(argv, { which, verb }) {
-  const a = parseFlags(argv);
+async function writeHandoff(argv, { which, verb, quiet = false }) {
+  const a = parseFlags(argv, { boolean: ['exact', 'create-only'] });
   const body = readFileSync(0, 'utf8').trim(); // stdin
   // --next used to be typed twice, once as a flag and once as the body's Next Action section.
   // The section is the truth; the flag is now an override for a body without one (2.0.0).
@@ -349,6 +360,7 @@ async function writeHandoff(argv, { which, verb }) {
   // `--slug _foo` used to pass here, land the markdown, and then throw inside writeCollection,
   // leaving an untracked .md, no entry, and a body that came from stdin and is therefore gone.
   if (!SLUG_OK.test(a.slug)) { console.error(`gtg ${verb}: --slug must start with a letter or digit and match [A-Za-z0-9_-]`); process.exit(2); }
+  if (a.due !== undefined && !dueOk(a.due)) { console.error(`gtg ${verb}: --due takes YYYY-MM-DD or YYYY-MM-DDTHH:MM`); process.exit(2); }
   if (!body) { console.error(`gtg ${verb}: empty body on stdin`); process.exit(2); }
   // Slug reuse lives HERE, not in a `list <name>` probe the skill runs first (one tool turn per
   // departure, 2026-08-26). A fresh slug for a project that already has an entry mints a
@@ -357,6 +369,41 @@ async function writeHandoff(argv, { which, verb }) {
   // uses) lends its slug. Two or more matches: ambiguous, keep the given slug. --exact opts
   // out, for the `gtg [project]` override where the caller means the slug literally.
   const everything = [...entries('active'), ...entries('backlog')];
+  const guarded = Object.hasOwn(a, 'expected-body-sha256');
+  if (guarded) {
+    // Compare the same snapshot list --json exposes. In particular, Forge's resume reader
+    // trims whitespace; it cannot be used here. Do not reload/reset Forge's write baseline.
+    a.exact = true;
+    const matches = ['active', 'backlog'].flatMap((shelf) => entries(shelf)
+      .filter((e) => e.slug === a.slug).map((e) => ({ e, shelf })));
+    let error;
+    if (FORGE?.stale) error = 'hub is unreachable; cached records cannot authorize a handoff';
+    else if (matches.length !== 1) error = 'exact project is missing or ambiguous';
+    else if (matches[0].shelf !== a['expected-shelf']) error = 'project changed shelf since the caller read';
+    else {
+      const rec = await withHandoff(matches[0].e, matches[0].shelf);
+      if (typeof rec.handoff !== 'string'
+        || createHash('sha256').update(rec.handoff, 'utf8').digest('hex') !== a['expected-body-sha256'].toLowerCase()) {
+        error = 'handoff changed or is missing since the caller read';
+      }
+    }
+    if (error) {
+      console.error(`gtg handoff: guarded write refused - ${error}`);
+      process.exitCode = 2;
+      return { refused: true };
+    }
+  }
+  // A queued idea authorizes creation, never replacing or re-shelving another project.
+  // Refuse before progress/WIP/body writes; ordinary handoffs retain their reuse behavior.
+  const createOnly = a['create-only'] === true;
+  if (createOnly) {
+    a.exact = true;
+    if (everything.some((e) => e.slug.toLowerCase() === a.slug.toLowerCase())) {
+      console.error(`gtg ${verb}: project slug already exists; this create-only idea was not written`);
+      process.exitCode = 2;
+      return { refused: true };
+    }
+  }
   if (!a.exact && !everything.some((e) => e.slug === a.slug)) {
     const name = String(a.project).toLowerCase();
     const near = everything.filter((e) => String(e.project).toLowerCase().includes(name));
@@ -371,7 +418,8 @@ async function writeHandoff(argv, { which, verb }) {
   // ROOT is the storage hub, NOT the project. A project in its own worktree has
   // its own branch - detect there, or the hub's branch gets recorded for everyone.
   // Inferred from where the call is made when the flag is omitted: a session runs in its
-  // worktree, so cwd's repo is the project unless that repo IS the hub.
+  // worktree, so cwd's repo is the project unless that repo IS the hub, or the hub is not a
+  // checkout's top (see inferWorktree).
   const worktree = a.worktree || inferWorktree();
   let branch = a.branch;
   if (!branch) {
@@ -381,6 +429,7 @@ async function writeHandoff(argv, { which, verb }) {
         { stdio: ['ignore', 'pipe', 'ignore'], timeout: 2000 }).toString().trim();
     } catch { branch = '?'; }
   }
+  const device = thisDevice();
   const d = new Date(); const p = (n) => String(n).padStart(2, '0');
   const stamp = `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}`;
   const prior = everything.find((e) => e.slug === a.slug);
@@ -437,6 +486,7 @@ async function writeHandoff(argv, { which, verb }) {
 Date: ${stamp.slice(0, 10)} ${p(d.getHours())}:${p(d.getMinutes())}
 Worktree: ${worktree}
 Branch: ${branch}
+Device: ${device}
 
 ${fullBody}
 
@@ -454,7 +504,7 @@ Say: "gtg ${a.slug}"
   const entry = {
     project: a.project, slug: a.slug, sessions,
     created: prior?.created || firstHandoffDate(a.slug) || nowIso(),
-    worktree, branch,
+    worktree, branch, device,
     // --parent is stable family metadata only the calling skill can know
     // (inferParent's slug-prefix fallback can't deduce e.g.
     // sub-project -> atlas) - carry it forward when the flag is
@@ -469,6 +519,9 @@ Say: "gtg ${a.slug}"
     duration_min: a.checkpoint ? undefined : sessionDurationMin(),
     harness: (typeof a.harness === 'string' ? a.harness : undefined) ?? detectHarness(),
     eta: a.eta || prior?.eta,
+    // --due belongs to the Next Action: a checkpoint that keeps the same Next Action keeps it,
+    // a new Next Action without --due drops it.
+    due: a.due ?? (prior?.next === String(a.next).slice(0, 150) ? prior?.due : undefined),
     // On the forge store the body lives inside the record, so there is no path to record.
     next: String(a.next).slice(0, 150), file: FORGE ? undefined : relFile, updated: nowIso(),
   };
@@ -477,7 +530,8 @@ Say: "gtg ${a.slug}"
     console.log(`--- ${COLLECTIONS[which]}/${a.slug}.json entry ---\n${JSON.stringify(entry, null, 2)}`);
     return;
   }
-  if (FORGE) FORGE.queueHandoff(a.slug, doc);
+  if (FORGE) FORGE.queueHandoff(a.slug, doc, { createOnly,
+    expectedBodySha256: a['expected-body-sha256']?.toLowerCase(), expectedShelf: a['expected-shelf'] });
   else {
     mkdirSync(dirname(join(ROOT, relFile)), { recursive: true });
     writeFileSync(join(ROOT, relFile), doc);
@@ -513,6 +567,13 @@ Say: "gtg ${a.slug}"
     try {
       console.log((await FORGE.flush(verb))[0] ?? '(forge: record unchanged)');
     } catch (e) {
+      // A refused queued create leaves its idea in Logic. Do not save a replacement body
+      // under an existing project's slug as the ordinary handoff recovery path would.
+      if (createOnly) {
+        console.error(`gtg ${verb}: create-only write failed - ${firstMeaningfulLine(e)}`);
+        process.exitCode = 1;
+        return { forgeFlushFailed: true };
+      }
       mkdirSync(dirname(join(ROOT, relFile)), { recursive: true });
       writeFileSync(join(ROOT, relFile), doc);
       console.error(`gtg ${verb}: forge write failed - ${firstMeaningfulLine(e)}`);
@@ -520,7 +581,7 @@ Say: "gtg ${a.slug}"
       // exitCode, not process.exit: on Windows (Node 24) exiting right after a fetch POST trips a
       // libuv assertion and the process dies with 0xC0000409 instead of the code asked for.
       process.exitCode = 1;
-      return;
+      return { forgeFlushFailed: true };
     }
   } else {
     commit([relFile, ...paths], subject);
@@ -544,11 +605,61 @@ Say: "gtg ${a.slug}"
       process.exitCode = 1;
     }
   }
-  console.log(verb === 'backlog'
+  // quiet: refresh and migrate print their own done line in place of RESUME.
+  if (!quiet) console.log(verb === 'backlog'
     ? `PARKED on backlog: "${a.project}" - reactivate with 'gtg active <n>' or "gtg ${a.slug}"`
     : `RESUME: "gtg ${a.slug}"`);
+  // Automated creation must preserve unrelated metadata, including review nudge stamps.
+  return { skipReview: createOnly, slug: a.slug, project: a.project };
 }
 const handoff = (argv) => writeHandoff(argv, { which: 'active', verb: 'handoff' });
+
+// refresh / migrate <device>: the handoff (same flags and body as `handoff`), then a new T3 thread
+// that resumes it, here or on <device> (lib/move.mjs). One call, one done line in place of
+// RESUME. With --slug and no --project the handoff is already written, so only the thread opens.
+// The device is checked before the handoff, so a typo writes nothing. A thread that fails to
+// open leaves the handoff saved, says so, and exits 1.
+async function move(argv, { refresh }) {
+  const verb = refresh ? 'refresh' : 'migrate';
+  const usage = refresh
+    ? 'usage: gtg refresh --project "<Name>" --slug <slug> [handoff flags] < body.md   (or --slug <slug> [--name "<Name>"] once the handoff is written)'
+    : 'usage: gtg migrate <device> --project "<Name>" --slug <slug> [handoff flags] < body.md   (or --slug <slug> [--name "<Name>"] once the handoff is written)';
+  const positional = argv[0] && !argv[0].startsWith('--') ? argv[0] : null;
+  const flags = parseFlags(argv);
+  if (refresh === !!positional || (!flags.project && typeof flags.slug !== 'string')) {
+    console.error(refresh && positional ? `${usage}\n(for another device, gtg migrate <device>)` : usage);
+    process.exitCode = 2;
+    return { refused: true };
+  }
+  if (!canOpenThread(ROOT)) {
+    console.error(`gtg ${verb} needs T3 Code: ${NEEDS_T3}`);
+    process.exitCode = 2;
+    return { refused: true };
+  }
+  const target = refresh ? thisDevice() : positional.toLowerCase();
+  if (!refresh && !loadServers(ROOT)[target]?.home) {
+    console.error(`gtg migrate: no device named ${target} with a "home" in .gtg/t3-servers.json`);
+    process.exitCode = 2;
+    return { refused: true };
+  }
+  let slug = flags.slug;
+  let name = typeof flags.name === 'string' ? flags.name : null;
+  let result = {};
+  if (flags.project) {
+    result = await writeHandoff(refresh ? argv : argv.slice(1), { which: 'active', verb: 'handoff', quiet: true });
+    if (result?.refused || result?.forgeFlushFailed) return result;
+    ({ slug } = result);
+    name = result.project;
+  }
+  try {
+    console.log(await openThread({ root: ROOT, target, slug, name, refresh }));
+  } catch (e) {
+    console.error(`gtg ${verb}: the handoff is saved, but the thread did not open - ${firstMeaningfulLine(e)}`);
+    console.error(`  resume it on ${target} with "gtg ${slug}"`);
+    process.exitCode = 1;
+  }
+  return result;
+}
 
 // backlog: with --project it parks a new entry; bare it lists the shelf (Task 3)
 function backlog(argv) {
@@ -565,7 +676,7 @@ function backlogList() {
   }
   console.log(`${bl.length} backlogged project${bl.length === 1 ? '' : 's'}:`);
   sortByProject(bl).forEach((e, i) => {
-    console.log(`${c('33', 'b' + (i + 1) + '.')} ${c('1;36', e.project)} ${c('2', 's' + (e.sessions ?? countHandoffFiles(e.slug)))} [${c('32', e.eta || '?')}] ${c('2', '(parked ' + ago(e.updated) + ')')}${e.harness ? c('2', ' ·' + e.harness) : ''}`);
+    console.log(`${c('33', 'b' + (i + 1) + '.')} ${c('1;36', e.project)} ${c('2', 's' + (e.sessions ?? countHandoffFiles(e.slug)))} [${c('32', e.eta || '?')}]${e.due ? ' ' + c('35', 'due ' + dueLabel(e.due)) : ''} ${c('2', '(parked ' + ago(e.updated) + ')')}${e.harness ? c('2', ' ·' + e.harness) : ''}`);
     console.log(`    next: ${e.next}`);
   });
   console.log('Activate: gtg active <n>');
@@ -574,16 +685,31 @@ function backlogList() {
 function help() {
   console.log(`gtg - pause/resume + backlog bookkeeping
   gtg handoff --project --slug [--next] [--eta] [--parent] [--worktree] [--branch] [--dry-run]   (body on stdin)
-      --next defaults to the body's "## Next Action" first line; --worktree to the repo you run it from
+      --due YYYY-MM-DD[THH:MM]  the date the Next Action is tied to (Logic's Week shows it)
+      --next defaults to the body's "## Next Action" first line; --worktree to the repo you run it
+      from when the hub is a checkout's top, else "repo root"
       [--wip]      commit the worktree's uncommitted work first (worktree only, never the shared root)
       [--exact]    keep --slug literally; by default one name-matching entry lends its slug
       [--harness]  who wrote it (claude|codex|...); auto-detected from the environment
       [--checkpoint] refresh the current handoff and set hook ctx.checkpoint without departure ceremony
+      [--expected-body-sha256 <64hex> --expected-shelf active|backlog] guarded handoff of an exact
+      existing slug; compare the exact UTF-8 handoff from list --json before writing. Exit 2 on refusal
       appends "## Task list" (harness task store) and, in a worktree, "## Commits this session"
       and "## Files touched" (git log since the session started) unless the body has them;
       runs <root>/.gtg/after-handoff.mjs afterwards if present (default export fn(ctx))
   gtg backlog [same flags]     park on the backlog shelf (body on stdin); bare = list the shelf
   gtg list [project]           active handoffs; read-only, with optional filter
+  gtg list --json              the whole store as {"active": [...], "backlog": [...]}, each record
+                               with its shelf and its current handoff text (null when none). Read-only
+  gtg show <slug> [--json]     print one entry's current handoff, or with --json its record as list
+                               --json prints it. Exit 1 when no entry has that slug. Read-only
+  gtg --version               plugin version; no hub or network required (guards require >=4.8.1)
+  gtg upnext <slug> --text "<item>"
+                               add one item to a project's Up next list
+  gtg upnext <slug> --edit=<n> --text "<item>" | --remove=<n> | --move=<n> --to=<m>
+                               change one Up next item by its position (1 = first)
+  gtg upnext <slug> --promote  make Up next item 1 the Next Action (clears the due date)
+  gtg edit <slug> [--next] [--eta] [--due|none] [--parent|none]   change fields without a handoff
   gtg back <n|slug> [--wake YYYY-MM-DD]
                                shelf an active entry to the backlog, optionally until a date
   gtg keep <slug> [--wake YYYY-MM-DD]
@@ -611,6 +737,14 @@ function help() {
   gtg stats                    one-screen scoreboard: streak, ships, sessions, effort
   gtg report                   full report JSON -> docs/handoffs/_report.json
   gtg progress <verb>          persistent task progress: init, add, show, list, update
+  T3 Code only (https://t3.codes); elsewhere these refuse and write nothing:
+  gtg refresh [handoff flags]  (body on stdin) write the handoff, then open a new T3 thread here
+                               whose first message is "gtg <slug>"; prints REFRESHED in place
+                               of RESUME. --slug <s> [--name "<N>"] alone only opens the thread
+  gtg migrate <device> [handoff flags]
+                               the same on a device in <root>/.gtg/t3-servers.json (MIGRATED).
+                               <root>/.gtg/t3-launch.mjs opens the thread; without it a
+                               GTG-LAUNCH line names the T3 MCP calls to make instead
 After a move (back/active/remove/resume/undo) the updated list auto-prints when
 stdout is a terminal; it stays silent when piped (so an AI wastes no context).
 Force either way with --list / --no-list.
@@ -629,9 +763,23 @@ const view = {
   entries,
   countHandoffFiles,
   get skip() { return reviewSkip; },
+  stampNudged,
 };
 const renderList = (argv) => renderListFor(argv, view);
-const printReview = (cmd, argv) => printReviewFor(cmd, argv, view);
+const takeReview = (cmd, argv) => takeReviewFor(cmd, argv, view);
+// Commits that only record that an entry was read or asked about. undo steps over them, so
+// `gtg undo` after a command still reverses that command, not the question printed under it.
+const STAMP_SUBJECT = /^gtg (?:nudge|resumed): /;
+// The review's question goes on the record, so no session asks about this entry again for
+// REVIEW_REPEAT_DAYS. On a stale forge read there is no hub copy to write to, so it is asked again.
+function stampNudged(which, slug) {
+  if (FORGE?.stale) return;
+  const arr = entries(which);
+  const e = arr.find((x) => x.slug === slug);
+  if (!e) return;
+  e.nudged = nowIso();
+  commit(saveEntries(which, arr), `gtg nudge: ${e.project}`);
+}
 
 function wakeFlag(v) {
   if (v === undefined) return undefined;
@@ -642,28 +790,198 @@ function wakeFlag(v) {
   return v;
 }
 
+// A Next Action's date, from --due: YYYY-MM-DD or YYYY-MM-DDTHH:MM, Singapore local time. Logic
+// (the personal planner behind the Sales Ops Board) puts the project on that day in its Week.
+function dueOk(v) {
+  if (typeof v !== 'string' || !/^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2})?$/.test(v)) return false;
+  const d = new Date(`${v.slice(0, 10)}T00:00:00Z`);
+  if (Number.isNaN(+d) || d.toISOString().slice(0, 10) !== v.slice(0, 10)) return false;
+  if (v.length > 10) {
+    const [h, m] = v.slice(11).split(':').map(Number);
+    if (h > 23 || m > 59) return false;
+  }
+  return true;
+}
+
+// Queued actions opt into exact lookup; ordinary numeric/fuzzy selectors retain their behavior.
+const exactSelector = (argv) => parseFlags(argv.slice(1), { boolean: ['exact'] }).exact === true;
+const commandEntry = (arr, t, argv, order = sortByProject) => exactSelector(argv)
+  ? arr.find((e) => e.slug === t) : resolveEntry(arr, t, order);
+const backlogSelector = (t, argv) => exactSelector(argv) ? t : t.replace(/^[bB](?=\d+$)/, '');
+
 function keep(argv) {
   const t = argv.find((x) => !x.startsWith('--'));
   if (!t) { console.error('Usage: gtg keep <slug> [--wake YYYY-MM-DD]'); process.exit(2); }
   const wake = wakeFlag(parseFlags(argv).wake);
   let which = 'active';
   let arr = entries('active');
-  let match = resolveEntry(arr, t, displayOrder);
+  let match = commandEntry(arr, t, argv, displayOrder);
   if (!match) {
     which = 'backlog';
     arr = entries('backlog');
-    match = resolveEntry(arr, t.replace(/^[bB](?=\d+$)/, ''));
+    match = commandEntry(arr, backlogSelector(t, argv), argv);
   }
   if (!match) { console.error(`No project matching '${t}'. Try 'gtg list' or 'gtg backlog'.`); process.exit(2); }
   if (which === 'active' && wake) {
     console.error(`gtg: --wake is for shelved work. Shelve it with: gtg back ${match.slug} --wake ${wake}`);
     process.exit(2);
   }
+  reviewSkip = match.slug;
   match.reviewed = nowIso(); // not `updated`: nobody worked on it, and list's "Nd ago" stays true
   if (which === 'backlog') { if (wake) match.wake = wake; else delete match.wake; }
   commit(saveEntries(which, arr), `gtg keep: ${match.project}`);
-  const quiet = wake ? `until ${wake}` : `for ${which === 'active' ? REVIEW_ACTIVE_DAYS : REVIEW_BACKLOG_DAYS} days`;
+  const quiet = wake ? `until ${wake}` : `for ${Math.max(which === 'active' ? REVIEW_ACTIVE_DAYS : REVIEW_BACKLOG_DAYS, repeatWait(match))} days`;
   console.log(`Kept: ${match.project}. Not asked about again ${quiet}.`);
+}
+
+// --- upnext --------------------------------------------------------------------
+// The current handoff doc for an entry, from whichever store holds it.
+async function readHandoffDoc(match) {
+  if (FORGE) return FORGE.latestHandoff(match);
+  return match.file && existsSync(join(ROOT, match.file)) ? readFileSync(join(ROOT, match.file), 'utf8') : null;
+}
+// --- list --json / show ----------------------------------------------------------
+// Reads for code rather than a person (Rodney's ATOM register reads its tasks through these). An
+// entry as the store holds it, with its shelf and its current handoff text, null when it has none.
+// On the forge store that is the raw stored record, since entries() blanks its `file` field and
+// readHandoffDoc trims the body (both for the other commands). The file store's handoff is the file.
+async function withHandoff(e, shelf) {
+  if (FORGE) {
+    const { handoff = null, ...rest } = FORGE.stored(e) ?? e;
+    return { ...rest, shelf, handoff };
+  }
+  return { ...e, shelf, handoff: await readHandoffDoc(e) };
+}
+// list --json prints the whole store and nothing else, so stdout always parses: no rows, no REVIEW
+// question, no flush. The dispatcher returns as soon as it sees readOnly. A filter is not applied.
+async function list(argv) {
+  if (parseFlags(argv, { boolean: ['json'] }).json !== true) return renderList(argv);
+  const doc = {};
+  for (const shelf of ['active', 'backlog']) doc[shelf] = await Promise.all(entries(shelf).map((e) => withHandoff(e, shelf)));
+  console.log(JSON.stringify(doc, null, 2));
+  return { readOnly: true };
+}
+// One entry by its exact slug, on either shelf. Exit codes are set rather than process.exit, since a
+// forge read may still have sockets open (see writeHandoff's forge branch).
+async function show(argv) {
+  const t = argv.find((x) => !x.startsWith('--'));
+  if (!t) { console.error('Usage: gtg show <slug> [--json]'); process.exitCode = 2; return { readOnly: true }; }
+  const json = parseFlags(argv, { boolean: ['json'] }).json === true;
+  for (const shelf of ['active', 'backlog']) {
+    const match = entries(shelf).find((e) => e.slug === t);
+    if (!match) continue;
+    const rec = await withHandoff(match, shelf);
+    if (json) console.log(JSON.stringify(rec, null, 2));
+    else if (rec.handoff === null) { console.error(`gtg show: '${t}' has no handoff`); process.exitCode = 1; }
+    else process.stdout.write(rec.handoff.endsWith('\n') ? rec.handoff : `${rec.handoff}\n`);
+    return { readOnly: true };
+  }
+  console.error(`gtg show: no entry '${t}'`);
+  process.exitCode = 1;
+  return { readOnly: true };
+}
+
+// Queue (forge) or write (file store) the new doc. Returns the file-store paths for commit().
+function writeHandoffDoc(match, doc) {
+  if (FORGE) { FORGE.queueHandoff(match.slug, doc); return []; }
+  writeFileSync(join(ROOT, match.file), doc);
+  return [match.file];
+}
+
+// Up next changes, without a new checkpoint: nobody worked on the project, so `updated` and
+// `sessions` stay. Logic queues these (the planner). Bare --text adds one item to the end; --edit,
+// --remove and --move change one item by its 1-based position; --promote makes item 1 the Next Action.
+async function upnext(argv) {
+  const t = argv[0];
+  const f = parseFlags(argv.slice(1), { boolean: ['exact', 'promote'] });
+  const usage = 'Usage: gtg upnext <slug> --text "<item>" | --edit=<n> --text "<item>" | --remove=<n> | --move=<n> --to=<m> | --promote';
+  const mode = f.promote === true ? 'promote' : ['edit', 'remove', 'move'].find((k) => Object.hasOwn(f, k)) ?? 'add';
+  const needsText = mode === 'add' || mode === 'edit';
+  if (!t || t.startsWith('--') || (needsText && (typeof f.text !== 'string' || !f.text.trim()))) { console.error(usage); process.exit(2); }
+  // A bare --remove is true, and Number(true) is 1: refuse it rather than act on item 1.
+  const posKeys = { edit: ['edit'], remove: ['remove'], move: ['move', 'to'] }[mode] ?? [];
+  if (posKeys.some((k) => typeof f[k] !== 'string')) { console.error(usage); process.exit(2); }
+  const all = [...entries('active').map((e) => ['active', e]), ...entries('backlog').map((e) => ['backlog', e])];
+  const found = all.find(([, e]) => e.slug === t);
+  if (!found) { console.error(`No project with slug '${t}'. Try 'gtg list' or 'gtg backlog'.`); process.exit(2); }
+  const [which, match] = found;
+  const doc = await readHandoffDoc(match);
+  if (!doc) { console.error(`gtg upnext: ${match.project} has no handoff to add to.`); process.exit(2); }
+  if (mode === 'add') {
+    commit(writeHandoffDoc(match, addUpNext(doc, f.text)), `gtg upnext: ${match.project}`);
+    console.log(`Up next for ${match.project}: ${f.text.replace(/\s+/g, ' ').trim()}`);
+    return;
+  }
+  const list = upNextItems(doc);
+  const pos = (v) => {
+    const n = Number(v);
+    if (!Number.isInteger(n) || n < 1 || n > list.length) {
+      console.error(list.length ? `gtg upnext: Up next has only ${list.length} items` : 'gtg upnext: Up next is empty');
+      process.exit(2);
+    }
+    return n - 1;
+  };
+  if (mode === 'promote') {
+    if (!list.length) { console.error('gtg upnext: Up next is empty'); process.exit(2); }
+    const [head, ...rest] = list;
+    // setSection refuses a body line starting with "## ": say so before writing anything.
+    if (head.startsWith('## ')) { console.error('gtg upnext: the first Up next item cannot start with "## "'); process.exit(2); }
+    const shelf = entries(which);
+    const rec = shelf.find((e) => e.slug === t);
+    rec.next = head.slice(0, 150);
+    delete rec.due;
+    const paths = writeHandoffDoc(match, setUpNext(setSection(doc, 'Next Action', head), rest));
+    commit([...saveEntries(which, shelf), ...paths], `gtg upnext: promote in ${match.project}`);
+    console.log(`Next Action for ${match.project}: ${head}`);
+    return { skipReview: true };
+  }
+  if (mode === 'edit') list[pos(f.edit)] = f.text.replace(/\s+/g, ' ').trim();
+  if (mode === 'remove') list.splice(pos(f.remove), 1);
+  if (mode === 'move') { const from = pos(f.move), to = pos(f.to); list.splice(to, 0, list.splice(from, 1)[0]); }
+  commit(writeHandoffDoc(match, setUpNext(doc, list)), `gtg upnext: ${mode} in ${match.project}`);
+  console.log(`Up next for ${match.project}: ${list.length} items`);
+}
+
+// One or more fields of an existing entry, without a session handoff. Logic's sheet uses it.
+// `updated` is left alone, as upnext leaves it: an edit is not a session.
+async function edit(argv) {
+  const t = argv[0];
+  const f = parseFlags(argv.slice(1), { boolean: ['exact'] });
+  const usage = 'Usage: gtg edit <slug> [--next "<text>"] [--eta "<text>"] [--due YYYY-MM-DD[THH:MM]|none] [--parent <slug>|none]';
+  const keys = ['next', 'eta', 'due', 'parent'].filter((k) => Object.hasOwn(f, k));
+  if (!t || t.startsWith('--') || !keys.length) { console.error(usage); process.exit(2); }
+  for (const k of keys) {
+    if (typeof f[k] !== 'string' || (k !== 'eta' && !f[k].trim())) { console.error(`gtg edit: --${k} needs a value`); process.exit(2); }
+  }
+  if (keys.includes('next') && f.next.trim().split(/\r?\n/).some((l) => l.startsWith('## '))) {
+    console.error('gtg edit: --next cannot contain a line starting with "## "'); process.exit(2);
+  }
+  if (keys.includes('due') && f.due !== 'none' && !dueOk(f.due)) {
+    console.error(`gtg: --due takes YYYY-MM-DD or YYYY-MM-DDTHH:MM, or none, got '${f.due}'`); process.exit(2);
+  }
+  if (keys.includes('parent') && f.parent !== 'none' && !SLUG_OK.test(f.parent)) {
+    console.error('gtg edit: --parent must be a slug or none'); process.exit(2);
+  }
+  for (const which of ['active', 'backlog']) {
+    const list = entries(which);
+    const match = list.find((e) => e.slug === t);
+    if (!match) continue;
+    const paths = [];
+    if (keys.includes('next')) {
+      const doc = await readHandoffDoc(match);
+      if (!doc) { console.error(`gtg edit: ${match.project} has no handoff to edit.`); process.exit(2); }
+      paths.push(...writeHandoffDoc(match, setSection(doc, 'Next Action', f.next)));
+      match.next = f.next.split('\n').find((l) => l.trim()).trim().slice(0, 150);
+    }
+    if (keys.includes('eta')) { if (f.eta.trim()) match.eta = f.eta.trim(); else delete match.eta; }
+    if (keys.includes('due')) { if (f.due === 'none') delete match.due; else match.due = f.due; }
+    if (keys.includes('parent')) { if (f.parent === 'none') delete match.parent; else match.parent = f.parent; }
+    commit([...saveEntries(which, list), ...paths], `gtg edit: ${match.project}`);
+    console.log(`Edited ${match.project}: ${keys.join(', ')}`);
+    return { skipReview: true };
+  }
+  console.error(`No project with slug '${t}'. Try 'gtg list' or 'gtg backlog'.`);
+  process.exit(2);
 }
 
 // --- back / active / remove / undo --------------------------------------------
@@ -672,8 +990,9 @@ function back(argv) {
   if (!t) { console.error("Usage: gtg back <number|slug> [--wake YYYY-MM-DD]  (see 'gtg list')"); process.exit(2); }
   const wake = wakeFlag(parseFlags(argv.slice(1)).wake);
   const act = entries('active');
-  const match = resolveEntry(act, t, displayOrder);
+  const match = commandEntry(act, t, argv, displayOrder);
   if (!match) { console.error(`No active project matching '${t}'. Try 'gtg list'.`); process.exit(2); }
+  reviewSkip = match.slug;
   match.updated = nowIso(); // restamp = parked-at
   delete match.reviewed;
   if (wake) match.wake = wake; else delete match.wake;
@@ -692,11 +1011,12 @@ function back(argv) {
 function activate(argv) {
   const t0 = argv[0];
   if (!t0) { console.error("Usage: gtg active <number|slug>  (see 'gtg backlog')"); process.exit(2); }
-  const t = t0.replace(/^[bB](?=\d+$)/, ''); // accept the b<n> numbering `gtg backlog` shows
+  const t = backlogSelector(t0, argv); // ordinary selectors accept backlog b<n> numbering
   const bl = entries('backlog');
   if (!bl.length) { console.error('Backlog is empty - nothing to activate.'); process.exit(2); }
-  const match = resolveEntry(bl, t);
+  const match = commandEntry(bl, t, argv);
   if (!match) { console.error(`No backlog project matching '${t0}'. Try 'gtg backlog'.`); process.exit(2); }
+  reviewSkip = match.slug;
   match.updated = nowIso();
   delete match.wake; // picked up, so the date it was waiting for no longer applies
   delete match.reviewed;
@@ -735,7 +1055,13 @@ function rename(argv) {
   const act = entries('active');
   const bl = entries('backlog');
   // Active wins a collision, the same precedence resume uses.
-  const match = resolveEntry(act, from, displayOrder) ?? resolveEntry(bl, from);
+  // --exact (the Logic applier) matches the slug only: no list number, no fuzzy name, and no
+  // fall-through to the parent-reference rename below.
+  const exact = parseFlags(argv, { boolean: ['exact'] }).exact === true;
+  const match = exact
+    ? act.find((e) => e.slug === from) ?? bl.find((e) => e.slug === from)
+    : resolveEntry(act, from, displayOrder) ?? resolveEntry(bl, from);
+  if (!match && exact) { console.error(`No project with slug '${from}'. Try 'gtg list' or 'gtg backlog'.`); process.exit(2); }
   if (!match) {
     // No entry carries this slug, but `parent` names a slug in the PORTFOLIO, not here. So a
     // rename over there leaves references here pointing at something that no longer exists, and
@@ -887,7 +1213,7 @@ function remove(argv, { completed = false } = {}) {
   const t = argv[0];
   if (!t) { console.error(`Usage: gtg ${completed ? 'complete' : 'remove'} <number|slug>  (see 'gtg list')`); process.exit(2); }
   const act = entries('active');
-  const match = resolveEntry(act, t, displayOrder);
+  const match = commandEntry(act, t, argv, displayOrder);
   if (match) {
     commit(saveEntries('active', act.filter((e) => e !== match)),
       `gtg prune: remove ${match.project} - confirmed done`);
@@ -896,7 +1222,7 @@ function remove(argv, { completed = false } = {}) {
   }
   // not in active - try the backlog (lets resume-consume clear a pulled backlog item)
   const bl = entries('backlog');
-  const blMatch = resolveEntry(bl, t.replace(/^[bB](?=\d+$)/, ''));
+  const blMatch = commandEntry(bl, backlogSelector(t, argv), argv);
   if (blMatch) {
     commit(saveEntries('backlog', bl.filter((e) => e !== blMatch)),
       `gtg prune: remove ${blMatch.project} from backlog - confirmed done`);
@@ -924,9 +1250,12 @@ function supersede(argv) {
 
   const act = entries('active');
   const bl = entries('backlog');
+  const exact = parseFlags(rest, { boolean: ['exact'] }).exact === true;
   const stripB = (s) => s.replace(/^[bB](?=\d+$)/, '');
   // Active wins a collision, the same precedence resume and rename use.
-  const match = resolveEntry(act, t, displayOrder) ?? resolveEntry(bl, stripB(t));
+  const match = exact
+    ? act.find((e) => e.slug === t) ?? bl.find((e) => e.slug === t)
+    : resolveEntry(act, t, displayOrder) ?? resolveEntry(bl, stripB(t));
   if (!match) { console.error(`No project matching '${t}'. Try 'gtg list' or 'gtg backlog'.`); process.exit(2); }
 
   // The absorbing entry is usually a gtg entry, but it can equally be a docs/projects
@@ -934,7 +1263,10 @@ function supersede(argv) {
   // than being rejected.
   let into = null;
   if (intoArg) {
-    const target = resolveEntry(act, intoArg, displayOrder) ?? resolveEntry(bl, stripB(intoArg));
+    const target = exact
+      ? act.find((e) => e.slug === intoArg) ?? bl.find((e) => e.slug === intoArg)
+      : resolveEntry(act, intoArg, displayOrder) ?? resolveEntry(bl, stripB(intoArg));
+    if (exact && !target) { console.error(`No project with slug '${intoArg}'. Try 'gtg list' or 'gtg backlog'.`); process.exit(2); }
     if (target === match) { console.error('gtg supersede: an entry cannot supersede itself'); process.exit(2); }
     into = target ? target.project : intoArg;
   }
@@ -956,7 +1288,7 @@ function supersede(argv) {
 // the dispatcher's flush, auto-list and review, which is where it used to call process.exit.
 async function resumeConsume(argv) {
   const code = await resumeFor(argv, {
-    root: ROOT, forge: FORGE, entries, commandFileFor, readStore, writeStore, commit,
+    root: ROOT, forge: FORGE, entries, saveEntries, commandFileFor, readStore, writeStore, commit,
     listAll: () => renderList([]), onPick: (slug) => { reviewSkip = slug; },
   });
   if (code !== undefined) process.exit(code);
@@ -986,10 +1318,12 @@ function commandFileFor(t) {
 // whole directory would discard records the commit never mentioned - the same
 // class of over-reach C1 was about, one level down.
 function undo() {
+  // The newest store commit that is not a stamp (STAMP_SUBJECT).
   const storeLog = (extra = []) => {
     try {
-      return execFileSync('git', ['log', '-1', '--format=%H%x1f%s%x1f%ar', ...extra, '--', ...STORE_PATHSPEC],
-        { cwd: ROOT }).toString().trim();
+      return execFileSync('git', ['log', '-n', '200', '--format=%H%x1f%s%x1f%ar', ...extra, '--', ...STORE_PATHSPEC],
+        { cwd: ROOT }).toString().split('\n').map((l) => l.trim())
+        .find((l) => l && !STAMP_SUBJECT.test(l.split('\x1f')[1])) ?? '';
     } catch { return ''; }
   };
   const parse = (line) => { const [sha, subject, age] = line.split('\x1f'); return { sha, subject, age }; };
@@ -1108,12 +1442,31 @@ const MOVE_CMDS = new Set(['back', 'active', 'complete', 'remove', 'rm', 'prune'
 // --- dispatch -----------------------------------------------------------------
 async function main(argv) {
   const [cmd, ...rest] = argv;
+  if (cmd === '--version') {
+    console.log(JSON.parse(readFileSync(join(CLI_DIR, '../../package.json'), 'utf8')).version);
+    return;
+  }
+  // Validate guard syntax even when the hub is unavailable, before reading/mutating its store.
+  if (['handoff', 'backlog'].includes(cmd)) {
+    const flags = parseFlags(rest);
+    const hash = flags['expected-body-sha256'];
+    const shelf = flags['expected-shelf'];
+    if (Object.hasOwn(flags, 'expected-body-sha256') || Object.hasOwn(flags, 'expected-shelf')) {
+      if (cmd !== 'handoff' || typeof hash !== 'string' || !/^[a-fA-F0-9]{64}$/.test(hash)
+        || !['active', 'backlog'].includes(shelf)) {
+        console.error('gtg handoff: guard requires paired --expected-body-sha256 <64hex> --expected-shelf active|backlog');
+        process.exitCode = 2;
+        return;
+      }
+    }
+  }
   // help reads no store, so it skips the git spawn, which was about 80 ms of a 137 ms `gtg help`.
   ROOT = ['help', '--help', '-h'].includes(cmd) ? '' : resolveRoot();
   const builtins = {
-    handoff, backlog, list: renderList, help, '--help': help, '-h': help,
+    handoff, backlog, list, show, help, '--help': help, '-h': help,
     back, active: activate, complete, remove, rm: remove, prune: remove, resume: resumeConsume, undo,
-    rename, unparent, log, supersede, keep,
+    rename, unparent, log, supersede, keep, upnext, edit,
+    refresh: (argv) => move(argv, { refresh: true }), migrate: (argv) => move(argv, { refresh: false }),
   };
   // Forge store: load before the command, flush after it. Commands that never read the records skip
   // the network. The refused ones read git history of the file store, which the forge store does
@@ -1121,7 +1474,7 @@ async function main(argv) {
   const NO_STORE = new Set(['help', '--help', '-h', 'progress']);
   const FORGE_REFUSED = new Set(['log', 'undo', 'stats', 'report']);
   // Commands that never write the store, so they may run on a stale cached read. undefined = bare gtg.
-  const STALE_OK = new Set([undefined, 'list', 'resume', 'learn']);
+  const STALE_OK = new Set([undefined, 'list', 'show', 'resume', 'learn']);
   // A failed or refused forge read stops the command with exit 1. Not process.exit: on Windows
   // (Node 24) exiting while fetch sockets are open trips a libuv assertion, and the process dies
   // with 0xC0000409 instead of 1 (seen on a 401). See writeHandoff's forge branch.
@@ -1162,29 +1515,63 @@ async function main(argv) {
     // command could write, so it stops here, before it prints anything that reads as done.
     if (FORGE?.stale) {
       const readOnly = STALE_OK.has(cmd) || (cmd === 'backlog' && !parseFlags(rest).project);
-      if (!readOnly && cmd !== 'handoff' && cmd !== 'backlog') {
+      // refresh and migrate write a handoff, so they get handoff's saved-body guard too.
+      if (!readOnly && !['handoff', 'backlog', 'refresh', 'migrate'].includes(cmd)) {
         console.error(`gtg ${cmd}: refused, the hub is unreachable. Only the cached store from ${FORGE.stale} could be read, and a write must start from the hub's copy. Re-run it when the hub is back.`);
         stopped = true;
-      } else if (readOnly) console.log(`(stale, hub unreachable) cached store from ${FORGE.stale}`);
+      } else if (readOnly) {
+        // To stderr under --json, so a stale read still prints one JSON object on stdout.
+        const json = ['list', 'show'].includes(cmd) && parseFlags(rest, { boolean: ['json'] }).json === true;
+        (json ? console.error : console.log)(`(stale, hub unreachable) cached store from ${FORGE.stale}`);
+      }
     }
   }
   const flushForge = async () => {
     if (!FORGE) return;
-    try { await FORGE.flush(cmd); } catch (e) {
+    try { await FORGE.flush(cmd ?? 'list'); } catch (e) {
       console.error(`gtg: forge write failed partway, re-run the command - ${firstMeaningfulLine(e)}`);
       process.exitCode = 1; // not process.exit, see writeHandoff's forge branch
     }
   };
   if (stopped) process.exitCode = 1;
-  else if (!cmd) { renderList([]); printReview('list', []); }
+  // The review is taken before the flush, so its stamp rides in the same write, and printed last,
+  // so a command's own result line (Completed:, Parked:) sits directly above the question.
+  else if (!cmd) {
+    renderList([]);
+    const review = takeReview('list', []);
+    await flushForge();
+    if (review) console.log(review);
+  }
   // hasOwn, not truthiness: every inherited Object key resolved here, so `gtg constructor` and
   // `gtg toString` called something that is not a verb instead of falling through to the
   // extension lookup and then the unknown-command error.
   else if (Object.hasOwn(builtins, cmd)) {
-    await builtins[cmd](rest);
-    await flushForge();
+    // Validate on the CHILD command's freshly loaded backend, as well as the applier's check.
+    // This is pre-mutation validation, not a cross-service transaction or distributed lock.
+    if (['complete', 'back', 'active', 'keep', 'upnext', 'edit', 'rename', 'supersede', 'remove'].includes(cmd)) {
+      const flags = parseFlags(rest.slice(1), { boolean: ['exact'] });
+      if (flags.exact === true || Object.hasOwn(flags, 'expected-shelf')) {
+        const all = ['active', 'backlog'].flatMap((shelf) => entries(shelf).map((e) => ({ ...e, shelf })));
+        const matches = all.filter((e) => e.slug === rest[0]);
+        let error;
+        if (flags.exact !== true) error = '--expected-shelf requires --exact';
+        else if (Object.hasOwn(flags, 'expected-shelf') && !['active', 'backlog'].includes(flags['expected-shelf'])) error = 'Invalid expected shelf';
+        else if (!matches.length) error = 'Project no longer exists with this exact slug';
+        else if (matches.length !== 1) error = 'Project slug is ambiguous across shelves';
+        else if (flags['expected-shelf'] && matches[0].shelf !== flags['expected-shelf']) error = 'Project changed shelf since this action was queued';
+        if (error) { console.error(`gtg: ${error}`); process.exitCode = 2; return; }
+      }
+    }
+    const result = await builtins[cmd](rest);
+    // readOnly: list --json and show, whose stdout is the answer and nothing else.
+    if (result?.refused || result?.readOnly) return;
+    // Queued children cannot show the user a review question, so never stamp it as asked.
+    const automated = result?.skipReview || Object.hasOwn(parseFlags(rest), 'expected-shelf');
+    const review = REVIEW_CMDS.has(cmd) && !result?.forgeFlushFailed && !automated ? takeReview(cmd, rest) : null;
+    // writeHandoff already reported the failure and saved the stdin body.
+    if (!result?.forgeFlushFailed) await flushForge();
     if (MOVE_CMDS.has(cmd)) maybeAutoList(rest);
-    if (REVIEW_CMDS.has(cmd)) printReview(cmd, rest);
+    if (review) console.log(review);
   }
   else {
     // Extension dispatch, ext resolved above. ctx is a STABILITY CONTRACT (additive-only).
@@ -1203,12 +1590,22 @@ async function main(argv) {
         const grab = (which) => (ownParent ? entries(which).filter((e) => e.parent === ownParent) : []);
         return { active: grab('active'), shelved: grab('backlog') };
       };
+      // Read-only authority for extensions that run child GTG commands. Re-open Forge rather
+      // than reuse this process's startup snapshot. Leave FORGE (and any pending writes) alone.
+      const projectEntries = async () => {
+        const cfg = forgeConfig(ROOT);
+        const fresh = cfg ? await openForge(cfg) : null;
+        if (fresh?.stale) throw new Error('Cannot verify project state: the hub is unreachable and its cached copy is stale.');
+        const grab = (shelf) => (fresh ? fresh.entries(shelf) : readCollection(ROOT, COLLECTIONS[shelf], { name: 'gtg' }))
+          .map((e) => ({ ...e, shelf }));
+        return [...grab('active'), ...grab('backlog')];
+      };
       // ownParent rides the ctx as well as being closed over by ownEntries: an extension that
       // WRITES an entry needs the same namespace its reader filters on, and deriving it a
       // second time on the writer side is exactly the drift class this closes.
       await mod.default({
         root: ROOT, args: rest, readStore, writeStore, commit, countHandoffFiles,
-        ownEntries, ownParent, sessionId: PROGRESS_SESSION_ID || undefined,
+        ownEntries, ownParent, projectEntries, sessionId: PROGRESS_SESSION_ID || undefined,
       });
       await flushForge();
     } catch (e) {

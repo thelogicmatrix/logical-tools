@@ -118,7 +118,9 @@ test('list is read-only and never auto-shelves stale active work', () => {
   assert.doesNotMatch(result.stdout, /shelves in|Auto-shelved/);
   assert.equal(active(root).length, 1);
   assert.equal(backlog(root).length, 0);
-  assert.equal(execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim(), before);
+  // The one write is the review's stamp on the entry it asked about.
+  assert.equal(execFileSync('git', ['rev-parse', 'HEAD~1'], { cwd: root, encoding: 'utf8' }).trim(), before);
+  assert.match(execFileSync('git', ['log', '-1', '--format=%s'], { cwd: root, encoding: 'utf8' }), /^gtg nudge: Alpha/);
 });
 
 test('a valid legacy dated handoff path is reused and old legacy files are preserved', () => {

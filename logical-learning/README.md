@@ -27,7 +27,8 @@ Two other logical-tools plugins pair with it, and it runs without either:
 Add the logical-tools marketplace as the [root README](../README.md) shows, then:
 
 ```
-/plugin install logical-learning@logical-tools
+/plugin install logical-learning@logical-tools        # Claude Code
+codex plugin add logical-learning@logical-tools       # Codex
 ```
 
 You need Node 18 or later and git. There are no other dependencies.

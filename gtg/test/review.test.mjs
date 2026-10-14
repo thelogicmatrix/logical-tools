@@ -32,10 +32,56 @@ function edit(root, which, slug, patch) {
 }
 const reviewLine = (r) => r.stdout.split('\n').find((l) => l.startsWith('REVIEW:'));
 
-test('thresholds are 5 days active and 14 days backlog', async () => {
+test('thresholds are 5 days active, 30 days backlog, and one question per entry per 30 days', async () => {
   // Pinned by value from lib/view.mjs, where they moved in #30, rather than grepped out of source.
-  const { REVIEW_ACTIVE_DAYS, REVIEW_BACKLOG_DAYS } = await import('../skills/gtg/lib/view.mjs');
-  assert.deepEqual([REVIEW_ACTIVE_DAYS, REVIEW_BACKLOG_DAYS], [5, 14]);
+  const { REVIEW_ACTIVE_DAYS, REVIEW_BACKLOG_DAYS, REVIEW_REPEAT_DAYS } = await import('../skills/gtg/lib/view.mjs');
+  assert.deepEqual([REVIEW_ACTIVE_DAYS, REVIEW_BACKLOG_DAYS, REVIEW_REPEAT_DAYS], [5, 30, 30]);
+});
+
+test('an entry asked about is not asked again for 30 days, by any session', () => {
+  const root = hub();
+  for (const s of ['alpha', 'beta']) handoff(root, s);
+  edit(root, 'active', 'alpha', { updated: daysAgo(9) });
+  edit(root, 'active', 'beta', { updated: daysAgo(6) });
+  assert.match(reviewLine(gtg(root, ['list'])), /^REVIEW: ALPHA /);
+  const rec = readCollection(root, 'docs/handoffs/active').find((e) => e.slug === 'alpha');
+  assert.ok(rec.nudged, 'the question is stamped on the record, which every session reads');
+  assert.match(reviewLine(gtg(root, ['list'])), /^REVIEW: BETA /, 'the next command moves on');
+  assert.equal(reviewLine(gtg(root, ['list'])), undefined, 'and then nothing is left to ask');
+  edit(root, 'active', 'alpha', { nudged: daysAgo(30) });
+  assert.match(reviewLine(gtg(root, ['list'])), /^REVIEW: ALPHA /, 'back after 30 days');
+});
+
+test('a resumed entry counts as touched for later commands and other sessions', () => {
+  const root = hub();
+  handoff(root, 'alpha');
+  const old = daysAgo(7);
+  edit(root, 'active', 'alpha', { updated: old });
+  assert.equal(gtg(root, ['resume', 'alpha']).status, 0);
+  const rec = readCollection(root, 'docs/handoffs/active')[0];
+  assert.ok(rec.resumedAt);
+  assert.equal(rec.updated, old, "updated is left alone, so list's age stays the last handoff");
+  assert.equal(reviewLine(gtg(root, ['list'])), undefined);
+});
+
+test('complete prints its line last, directly above the review', () => {
+  const root = hub();
+  for (const s of ['alpha', 'beta']) handoff(root, s);
+  edit(root, 'active', 'beta', { updated: daysAgo(6) });
+  const lines = gtg(root, ['complete', 'alpha']).stdout.trim().split('\n');
+  assert.match(lines.at(-1), /^REVIEW: BETA /);
+  assert.match(lines.at(-2), /^Completed: ALPHA/);
+});
+
+test('undo skips the stamp a review left after the change', () => {
+  const root = hub();
+  for (const s of ['alpha', 'beta']) handoff(root, s);
+  edit(root, 'active', 'beta', { updated: daysAgo(6) });
+  execFileSync('git', ['commit', '-qam', 'age beta'], { cwd: root });
+  assert.match(reviewLine(gtg(root, ['complete', 'alpha'])), /^REVIEW: BETA /);
+  const r = gtg(root, ['undo']);
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(readCollection(root, 'docs/handoffs/active').some((e) => e.slug === 'alpha'), 'the complete was undone');
 });
 
 test('no review line when everything is fresh', () => {
@@ -58,12 +104,16 @@ test('one question only, a passed wake date first, then the oldest active entry'
   for (const s of ['alpha', 'beta', 'gamma']) handoff(root, s);
   edit(root, 'active', 'alpha', { updated: daysAgo(6) });
   edit(root, 'active', 'beta', { updated: daysAgo(9) });
-  assert.equal(gtg(root, ['back', 'gamma', '--wake', isoDay(1)]).status, 0);
+  const parked = gtg(root, ['back', 'gamma', '--wake', isoDay(1)]);
+  assert.equal(parked.status, 0);
+  assert.match(reviewLine(parked), /^REVIEW: BETA \[beta\] untouched 9d\./, 'never the entry just moved');
   const out = gtg(root, ['list']).stdout;
   assert.equal(out.split('\n').filter((l) => l.startsWith('REVIEW:')).length, 1);
   assert.match(reviewLine({ stdout: out }), /^REVIEW: GAMMA \[gamma\] was parked until /);
-  assert.equal(gtg(root, ['keep', 'gamma']).status, 0);
-  assert.match(reviewLine(gtg(root, ['list'])), /^REVIEW: BETA \[beta\] untouched 9d\./);
+  const kept = gtg(root, ['keep', 'gamma']);
+  assert.equal(kept.status, 0);
+  assert.match(reviewLine(kept), /^REVIEW: ALPHA \[alpha\] untouched 6d\./, 'beta was already asked');
+  assert.equal(reviewLine(gtg(root, ['list'])), undefined, 'each entry once');
 });
 
 test('a future wake date keeps a backlog entry quiet however old it is', () => {
@@ -74,14 +124,14 @@ test('a future wake date keeps a backlog entry quiet however old it is', () => {
   assert.equal(reviewLine(gtg(root, ['list'])), undefined);
 });
 
-test('an undated backlog entry is asked about at 14 days, not 13', () => {
+test('an undated backlog entry is asked about at 30 days, not 29', () => {
   const root = hub();
   handoff(root, 'alpha');
   gtg(root, ['back', 'alpha']);
-  edit(root, 'backlog', 'alpha', { updated: daysAgo(13.9) });
+  edit(root, 'backlog', 'alpha', { updated: daysAgo(29.9) });
   assert.equal(reviewLine(gtg(root, ['list'])), undefined);
-  edit(root, 'backlog', 'alpha', { updated: daysAgo(14) });
-  assert.match(reviewLine(gtg(root, ['list'])), /^REVIEW: ALPHA \[alpha\] parked 14d\./);
+  edit(root, 'backlog', 'alpha', { updated: daysAgo(30) });
+  assert.match(reviewLine(gtg(root, ['list'])), /^REVIEW: ALPHA \[alpha\] parked 30d\./);
 });
 
 test('keep resets the clock without touching updated, and --wake on keep sets a backlog wake', () => {

@@ -5,7 +5,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { displayOrder, printReview, renderList, resolveEntry, reviewCandidate } from '../skills/gtg/lib/view.mjs';
+import { displayOrder, renderList, resolveEntry, reviewCandidate, takeReview } from '../skills/gtg/lib/view.mjs';
 
 const DAY = 864e5;
 const at = (days) => new Date(Date.now() - days * DAY).toISOString();
@@ -88,32 +88,38 @@ test('displayOrder and resolveEntry agree on what a number means', () => {
 
 test('reviewCandidate asks about a woken shelf first, then stale active, then stale backlog', () => {
   // Every date from this one `now`. Taken separately, a date made a millisecond after `now` is
-  // 14.99 days old and floors to 14.
+  // 30.99 days old and floors to 30.
   const now = Date.now();
   const at = (days) => new Date(now - days * DAY).toISOString();
   const stale = entry({ project: 'Stale', slug: 'stale', updated: at(6) });
   const woken = entry({ project: 'Woken', slug: 'woken', updated: at(20), wake: at(1).slice(0, 10) });
   const later = entry({ project: 'Later', slug: 'later', updated: at(40), wake: at(-5).slice(0, 10) });
-  const dusty = entry({ project: 'Dusty', slug: 'dusty', updated: at(15) });
+  const dusty = entry({ project: 'Dusty', slug: 'dusty', updated: at(31) });
   assert.match(reviewCandidate({ entries: ctxFor([stale], [woken, dusty]).entries }, now), /^REVIEW: Woken \[woken\] was parked until /);
   assert.match(reviewCandidate({ entries: ctxFor([stale], [later, dusty]).entries }, now), /^REVIEW: Stale \[stale\] untouched 6d\./);
-  assert.match(reviewCandidate({ entries: ctxFor([], [later, dusty]).entries }, now), /^REVIEW: Dusty \[dusty\] parked 15d\./);
+  assert.match(reviewCandidate({ entries: ctxFor([], [later, dusty]).entries }, now), /^REVIEW: Dusty \[dusty\] parked 31d\./);
   assert.equal(reviewCandidate({ entries: ctxFor([], [later]).entries }, now), null, 'a future wake date stays out');
   assert.equal(reviewCandidate({ entries: ctxFor([stale]).entries, skip: 'stale' }, now), null, 'never the entry being worked on');
   const reviewed = { ...stale, reviewed: at(1) };
   assert.equal(reviewCandidate({ entries: ctxFor([reviewed]).entries }, now), null, '`keep` restarts the clock');
+  assert.equal(reviewCandidate({ entries: ctxFor([{ ...stale, resumedAt: at(1) }]).entries }, now), null, 'a resume restarts it too');
+  assert.equal(reviewCandidate({ entries: ctxFor([], [{ ...dusty, updated: at(29) }]).entries }, now), null, 'backlog waits 30 days');
+  assert.equal(reviewCandidate({ entries: ctxFor([{ ...stale, nudged: at(29) }]).entries }, now), null, 'asked 29 days ago');
+  assert.match(reviewCandidate({ entries: ctxFor([{ ...stale, nudged: at(30) }]).entries }, now), /^REVIEW: Stale/, 'asked 30 days ago');
 });
 
-test('printReview stays quiet on a filtered list and a checkpoint, and never fails its command', () => {
-  const ctx = ctxFor([entry({ project: 'Stale', slug: 'stale', updated: at(6) })]);
-  assert.match(capture(() => printReview('list', [], ctx)), /^REVIEW: Stale/);
-  assert.equal(capture(() => printReview('list', ['stale'], ctx)), '');
-  assert.equal(capture(() => printReview('handoff', ['--checkpoint'], ctx)), '');
+test('takeReview stamps the question, stays quiet on a filtered list and a checkpoint, and never fails its command', () => {
+  const stamped = [];
+  const ctx = { ...ctxFor([entry({ project: 'Stale', slug: 'stale', updated: at(6) })]), stampNudged: (which, slug) => stamped.push(`${which}/${slug}`) };
+  assert.match(takeReview('list', [], ctx), /^REVIEW: Stale/);
+  assert.deepEqual(stamped, ['active/stale']);
+  assert.equal(takeReview('list', ['stale'], ctx), null);
+  assert.equal(takeReview('handoff', ['--checkpoint'], ctx), null);
   const errs = [];
   const real = console.error;
   console.error = (m) => errs.push(m);
   try {
-    assert.equal(capture(() => printReview('list', [], { entries: () => { throw new Error('store gone'); } })), '');
+    assert.equal(takeReview('list', [], { entries: () => { throw new Error('store gone'); } }), null);
   } finally { console.error = real; }
   assert.deepEqual(errs, ['gtg: review skipped - store gone']);
 });

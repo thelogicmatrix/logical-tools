@@ -13,6 +13,7 @@ import { CS_END, CS_START, NARRATIVE_UNWRITTEN, pagePath, renderList, setCurrent
 import { commit, readStore, resolveRoot, today, writeStore } from './lib/portfolio.mjs';
 import { PROJECTS_DIR, REL_ENTRIES, REL_INDEX, REL_STORE, THEMES, THEME_ORDER, assertRenderable, renderIndex, validateSlug, validateStatus, validateTheme } from './lib/render.mjs';
 import { cmdSync, lastCommitDates } from './lib/sync.mjs';
+import { syncStore, installStoreHook } from './store-sync.mjs';
 export { PROJECTS_DIR, REL_ENTRIES, REL_INDEX, REL_STORE, STATUSES, STATUS_ORDER, THEMES, THEME_ORDER, UNTHEMED, assertRenderable, groupByTheme, parseIndex, renderIndex, sortProjects, themeLabel, validateSlug, validateStatus, validateTheme } from './lib/render.mjs';
 export { CS_END, CS_START, NARRATIVE_UNWRITTEN, currentStateFirstLine, getCurrentState, renderList, setCurrentState } from './lib/page.mjs';
 export { commit, readStore, resolveRoot, today, writeStore } from './lib/portfolio.mjs';
@@ -362,6 +363,15 @@ export function main(argv = process.argv.slice(2)) {
   // help reads no store, so it skips the git spawn that finds one.
   const root = ['help', '--help', '-h'].includes(cmd) ? '' : resolveRoot();
   try {
+    if (root && !process.env.PROJECTS_STORE_SYNC) {
+      installStoreHook(root);
+      const result = syncStore(root);
+      if (!['local', 'level', 'pulled', 'pushed'].includes(result)) {
+        const readOnly = !cmd || Object.hasOwn(THEMES, cmd) || ['list', 'log', 'sync'].includes(cmd);
+        if (!readOnly && ['conflict', 'busy', 'branch', 'locked'].includes(result)) throw new Error(`projects: shared store ${result}; retry after resolving it (see .git/projects-sync.log)`);
+        console.error(`projects: shared store ${result}; using the local copy (see .git/projects-sync.log)`);
+      }
+    }
     if (!cmd) return builtins.list(root, []);
     // A theme reads as a filter, not a verb. Routed HERE rather than added to `builtins`,
     // which stays a map of verbs only so the Object.hasOwn guard below keeps doing exactly

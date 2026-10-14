@@ -14,8 +14,8 @@ import { fileURLToPath } from 'node:url';
 const CLI = join(dirname(fileURLToPath(import.meta.url)), '..', 'skills', 'gtg', 'gtg.mjs');
 const sha = (text) => createHash('sha1').update(text).digest('hex');
 const file = (rec) => JSON.stringify(rec, null, 2) + '\n';
-const ALPHA = { slug: 'alpha', project: 'Alpha', shelf: 'active', next: 'Ship it', updated: '2026-09-28T10:00:00+00:00', sessions: 1, handoff: '## Next Action\nShip alpha\n' };
-const BETA = { slug: 'beta', project: 'Beta', shelf: 'active', next: 'Ship beta', updated: '2026-09-28T10:00:00+00:00', sessions: 1, handoff: '## Next Action\nShip beta\n' };
+const ALPHA = { slug: 'alpha', project: 'Alpha', shelf: 'active', next: 'Ship it', updated: new Date().toISOString(), sessions: 1, handoff: '## Next Action\nShip alpha\n' };
+const BETA = { slug: 'beta', project: 'Beta', shelf: 'active', next: 'Ship beta', updated: new Date().toISOString(), sessions: 1, handoff: '## Next Action\nShip beta\n' };
 
 // mode: 'up' answers, 'hang' never answers, 'auth' answers every request with 401.
 async function stubHub(t) {
@@ -90,6 +90,20 @@ test('a warm read fetches the tree and only the blobs it has not cached', async 
   assert.deepEqual(hub.hits, ['tree', 'blobs:1'], 'one changed record: one blob');
 });
 
+test('a matching cached handoff never authorizes a guarded write or recovery body', async (t) => {
+  const hub = await stubHub(t);
+  const listed = await hub.run(['list', '--json']);
+  const record = JSON.parse(listed.stdout).active.find((r) => r.slug === 'alpha');
+  await hub.down();
+  const r = await hub.run(['handoff', '--project', 'Alpha', '--slug', 'alpha',
+    '--expected-body-sha256', createHash('sha256').update(record.handoff, 'utf8').digest('hex'),
+    '--expected-shelf', 'active'], '## Next Action\nOffline result\n');
+  assert.equal(r.status, 2, r.stderr);
+  assert.equal(r.stdout, '');
+  assert.ok(!existsSync(join(hub.root, 'docs/handoffs/current/alpha.md')));
+  assert.equal(hub.files.get('docs/handoffs/records/alpha.json'), file(ALPHA));
+});
+
 test('with the hub down, read-only commands serve the cache with a stale line and every write refuses', async (t) => {
   const hub = await stubHub(t);
   assert.equal((await hub.run(['list'])).status, 0);
@@ -109,6 +123,16 @@ test('with the hub down, read-only commands serve the cache with a stale line an
   const shelf = await hub.run(['backlog']);
   assert.equal(shelf.status, 0, shelf.stderr);
   assert.match(shelf.stdout, /^\(stale, hub unreachable\)/);
+  // Under --json the stale line goes to stderr, so stdout is still one JSON object.
+  for (const args of [['list', '--json'], ['show', 'alpha', '--json']]) {
+    const r = await hub.run(args);
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stderr, /^\(stale, hub unreachable\)/, args.join(' '));
+    assert.ok(JSON.parse(r.stdout), args.join(' '));
+  }
+  const shown = await hub.run(['show', 'alpha']);
+  assert.equal(shown.status, 0, shown.stderr);
+  assert.match(shown.stdout, /^\(stale, hub unreachable\)/);
 
   for (const args of [['back', 'alpha'], ['active', 'alpha'], ['keep', 'alpha'], ['complete', 'alpha'], ['remove', 'alpha'],
     ['supersede', 'alpha'], ['rename', 'alpha', 'gamma'], ['unparent', 'alpha']]) {

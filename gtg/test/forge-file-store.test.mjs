@@ -180,8 +180,8 @@ test('file store retries a failed read, and resends a failed write only once, af
 
 test('file store reads records from the git tree and one batch of blobs, with fallbacks for a truncated tree and a server without the batch route', async (t) => {
   const records = {
-    'docs/handoffs/records/alpha.json': JSON.stringify({ slug: 'alpha', project: 'Alpha', shelf: 'active', next: 'Ship alpha', handoff: 'alpha body' }),
-    'docs/handoffs/records/beta.json': JSON.stringify({ slug: 'beta', project: 'Beta', shelf: 'backlog', next: 'Ship beta' }),
+    'docs/handoffs/records/alpha.json': JSON.stringify({ slug: 'alpha', project: 'Alpha', shelf: 'active', next: 'Ship alpha', updated: new Date().toISOString(), handoff: 'alpha body' }),
+    'docs/handoffs/records/beta.json': JSON.stringify({ slug: 'beta', project: 'Beta', shelf: 'backlog', next: 'Ship beta', updated: new Date().toISOString() }),
     'docs/handoffs/records/notes/gamma.json': JSON.stringify({ slug: 'gamma', project: 'Gamma', shelf: 'active' }),
     'docs/handoffs/records/README.md': 'not a record',
   };
@@ -250,6 +250,14 @@ test('file store reads records from the git tree and one batch of blobs, with fa
   assert.deepEqual(hits, { tree: 1, batch: 1, blob: 0, listing: 0, contents: 0 });
   assert.match((await run(['resume', 'alpha'])).stdout, /alpha body/);
 
+  // list --json reads the same records, each with its handoff body (null when it has none), and writes nothing.
+  const json = await run(['list', '--json']);
+  assert.equal(json.status, 0, json.stderr);
+  const doc = JSON.parse(json.stdout);
+  assert.deepEqual(doc.active.map((x) => [x.slug, x.shelf, x.next, x.handoff]), [['alpha', 'active', 'Ship alpha', 'alpha body']]);
+  assert.deepEqual(doc.backlog.map((x) => [x.slug, x.shelf, x.next, x.handoff]), [['beta', 'backlog', 'Ship beta', null]]);
+  assert.equal(puts.length, 0, 'list --json writes nothing');
+
   // A PUT after a tree read carries the blob sha from the tree, which is the sha the contents API checks.
   const handoff = await run(['handoff', '--project', 'Alpha', '--slug', 'alpha'], '## Next Action\nShip more\n');
   assert.equal(handoff.status, 0, handoff.stderr);
@@ -267,6 +275,51 @@ test('file store reads records from the git tree and one batch of blobs, with fa
   assert.equal(fallback.status, 0, fallback.stderr);
   assert.match(fallback.stdout, /Beta/);
   assert.deepEqual(hits, { tree: 1, batch: 1, blob: 2, listing: 1, contents: 0 });
+});
+
+test('list --json and show print a forge record as stored: every field, and the handoff byte for byte', async (t) => {
+  // `file` is a field the adapter blanks for the writers, and resume trims the body. The read
+  // commands promise what the store holds, so neither may reach them.
+  const handoff = '    code\n\n  indented line\n\n\n';
+  const records = {
+    'docs/handoffs/records/alpha.json': JSON.stringify({ slug: 'alpha', project: 'Alpha', shelf: 'active', next: 'Ship alpha', file: 'docs/handoffs/current/alpha.md', extra: { kept: true }, handoff }),
+    'docs/handoffs/records/beta.json': JSON.stringify({ slug: 'beta', project: 'Beta', shelf: 'backlog', next: 'Ship beta' }),
+  };
+  let writes = 0;
+  const server = createServer(async (req, res) => {
+    for await (const _ of req) { /* drain */ }
+    const url = new URL(req.url, 'http://stub');
+    const send = (status, data) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(data)); };
+    if (req.method !== 'GET') { writes++; return send(500, { message: 'no writes expected' }); }
+    if (url.pathname === '/api/v1/repos/o/r/git/trees/HEAD') {
+      return send(200, { truncated: false, tree: Object.entries(records).map(([path, text]) => ({ path, type: 'blob', sha: sha(text) })) });
+    }
+    if (url.pathname === '/api/v1/repos/o/r/git/blobs') {
+      const texts = url.searchParams.get('shas').split(',').map((want) => Object.values(records).find((x) => sha(x) === want));
+      return send(200, texts.map((x) => ({ sha: sha(x), encoding: 'base64', content: Buffer.from(x).toString('base64') })));
+    }
+    return send(404, { message: 'unexpected' });
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => server.close());
+  const root = hubWith({ api: `http://127.0.0.1:${server.address().port}/api/v1`, repo: 'o/r', store: 'files' });
+  const env = coldCache();
+
+  const listed = await runIn(root, ['list', '--json'], env);
+  assert.equal(listed.status, 0, listed.stderr);
+  const doc = JSON.parse(listed.stdout);
+  assert.deepEqual(doc.active, [{ ...JSON.parse(records['docs/handoffs/records/alpha.json']), shelf: 'active', handoff }]);
+  assert.deepEqual(doc.backlog, [{ ...JSON.parse(records['docs/handoffs/records/beta.json']), shelf: 'backlog', handoff: null }]);
+  const shown = await runIn(root, ['show', 'alpha', '--json'], env);
+  assert.equal(shown.status, 0, shown.stderr);
+  assert.deepEqual(JSON.parse(shown.stdout), doc.active[0]);
+  const plain = await runIn(root, ['show', 'alpha'], env);
+  assert.equal(plain.status, 0, plain.stderr);
+  assert.equal(plain.stdout, handoff, 'show prints the stored handoff exactly');
+  // The records carry no `updated`, so each is REVIEW-eligible and a command that takes the review
+  // stamps one (resume below does). The three reads above wrote nothing.
+  assert.equal(writes, 0, 'the read commands write nothing');
+  assert.match((await runIn(root, ['resume', 'alpha'], env)).stdout, /code[\s\S]*indented line/, 'resume still reads the body');
 });
 
 // An empty store: no commit yet, so the tree and the records listing are both 404 and the repo exists.

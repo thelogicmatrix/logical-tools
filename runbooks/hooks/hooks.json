@@ -7,6 +7,7 @@
       { "hooks": [ { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/index.mjs\"", "timeout": 10, "statusMessage": "Loading runbooks" } ] }
     ],
     "PreToolUse": [
+      { "matcher": "Agent|Task", "hooks": [ { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/router.mjs\" --agent", "timeout": 15, "statusMessage": "Routing subagent runbooks" } ] },
       { "matcher": "Skill", "hooks": [ { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/resolve.mjs\" --hook", "timeout": 10 } ] },
       { "matcher": "Bash|PowerShell", "hooks": [ { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/action.mjs\"", "timeout": 5 } ] }
     ],

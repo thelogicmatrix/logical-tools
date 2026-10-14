@@ -3,9 +3,12 @@
 import test from 'node:test';
 import assert from 'node:assert';
 import { spawnSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ATTEMPTS } from './lib.mjs';
-import { MAX_MESSAGES, MAX_PARTS, TAGS, checkIdentity, fired, parseSearch, partsFor, postmanArgs, searchMail,
+import { MAX_MESSAGES, MAX_PARTS, TAGS, checkIdentity, findPostman, fired, parseSearch, partsFor, postmanArgs, searchMail,
   searchStateFor, stateFor, sweep, toTags } from './jevmail.mjs';
 
 const JEVMAIL = fileURLToPath(new URL('./jevmail.mjs', import.meta.url));
@@ -139,4 +142,41 @@ test('search: the work refusal, the narrowing cap, ranking, and the tag-mode re-
   } finally {
     globalThis.fetch = realFetch;
   }
+});
+
+// #126. An installed jevtools has no postman sibling, so postman.py comes from postman's own
+// install: POSTMAN_PY first, then the newest postman in a Claude or Codex plugin cache.
+test('postman: POSTMAN_PY, then the newest cached install, else an error naming what to install', (t) => {
+  const home = mkdtempSync(join(tmpdir(), 'jevmail-postman-'));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const place = (...p) => { const f = join(home, ...p, 'skills', 'postman', 'postman.py'); mkdirSync(join(f, '..'), { recursive: true }); writeFileSync(f, ''); return f; };
+  const env = {};
+  const missing = () => findPostman({ env, home });
+  assert.throws(missing, (e) => /postman@logical-tools/.test(e.message) && /POSTMAN_PY/.test(e.message));
+  // A Codex-only install is found.
+  const codex = place('.codex', 'plugins', 'cache', 'logical-tools', 'postman', '1.1.1');
+  assert.strictEqual(missing(), codex);
+  // The highest version wins across caches, compared by number (1.1.10 over 1.1.9), not by name.
+  const cache = ['.claude', 'plugins', 'cache', 'logical-tools', 'postman'];
+  place(...cache, '1.1.9');
+  const newest = place(...cache, '1.1.10');
+  place(...cache, '1.0.2');
+  assert.strictEqual(missing(), newest);
+  // CLAUDE_CONFIG_DIR names a second account's config folder.
+  const other = place('.claudework', 'plugins', 'cache', 'logical-tools', 'postman', '2.0.0');
+  assert.strictEqual(findPostman({ env: { CLAUDE_CONFIG_DIR: join(home, '.claudework') }, home }), other);
+  // POSTMAN_PY wins, and one naming a file that is not there is an error, not a fall-through.
+  assert.strictEqual(findPostman({ env: { POSTMAN_PY: codex }, home }), codex);
+  assert.throws(() => findPostman({ env: { POSTMAN_PY: join(home, 'nope.py') }, home }), /POSTMAN_PY.*nope\.py/);
+});
+
+test('postman: a search with no postman installed exits 1 with the install line and reads nothing', (t) => {
+  const home = mkdtempSync(join(tmpdir(), 'jevmail-nopostman-'));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const env = { ...process.env, HOME: home, USERPROFILE: home, OPENROUTER_KEY_JEVTOOLS: 'k-test' };
+  delete env.POSTMAN_PY; delete env.CLAUDE_CONFIG_DIR; delete env.CODEX_HOME;
+  const r = spawnSync(process.execPath, [JEVMAIL, '--ask', 'x', '--identity', 'personal', '--query', 'q'],
+    { input: '[]', encoding: 'utf8', env });
+  assert.deepStrictEqual([r.status, r.stdout], [1, ''], r.stdout);
+  assert.match(r.stderr, /^jevmail: [^\n]*postman@logical-tools[^\n]*\r?\n$/);
 });

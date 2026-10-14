@@ -10,7 +10,9 @@ steering via each page's Future Directions. It is deliberately *not* a
 what-should-I-do-today dashboard.
 
 `projects` below is `node "${CLAUDE_PLUGIN_ROOT}/skills/logical-projects/projects.mjs"`. Store:
-`docs/projects/` in the current git repo, or `$PROJECTS_ROOT` when set. The CLI owns every
+`docs/projects/` in the current git repo, or `$PROJECTS_ROOT` when set. A persisted
+`~/.projects/store.json` supplies its `root` when the variable is unset. Narrative edits use
+that configured root's `docs/projects/`, too. The CLI owns every
 mechanic: it renders `INDEX.md` from `docs/projects/entries/<slug>.json`, one file per project,
 on every mutating verb (a hand-edit is overwritten), a write-guard hook denies `Write` and `Edit`
 on both, and each mutating verb commits only the files it touched.

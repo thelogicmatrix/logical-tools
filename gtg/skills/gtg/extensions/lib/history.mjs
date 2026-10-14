@@ -3,14 +3,15 @@
 // readDurations (later tasks) touch git/disk. No mutation, ever.
 
 import { execFileSync } from 'node:child_process';
-import { readdirSync, existsSync } from 'node:fs';
+import { readdirSync, existsSync, realpathSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { readCollection } from '../../lib/store.mjs';
 
-// Windows-safe path equality: resolve() normalises slashes/trailing-slash, then
-// compare case-insensitively (Windows filesystems are case-insensitive).
+// Windows-safe path equality: the real path (a junctioned hub resolves to its target, as git
+// reports it), else resolve(), compared case-insensitively (Windows filesystems are case-insensitive).
 function samePath(a, b) {
-  return resolve(a).toLowerCase() === resolve(b).toLowerCase();
+  const real = (s) => { try { return realpathSync.native(s); } catch { return resolve(s); } };
+  return real(a).toLowerCase() === real(b).toLowerCase();
 }
 
 export function slugify(project) {
@@ -378,7 +379,10 @@ function isoWeek(dateStr) {
 // (~6% of the total on the live store before this guard). A handoff is the only
 // commit that actually re-times anything, so the subject is the exact filter.
 // Fresh object per return path: callers may mutate the result.
+// Keep the existing empty counters for API consumers; available distinguishes
+// an unreadable history from a successful read with no timed sessions.
 const noDurations = () => ({
+  available: false,
   bySlug: {}, hoursBySlug: {}, hoursByWeek: {},
   total: 0, sessionsTimed: 0, avgSessionMin: null, longestSessionMin: null,
 });
@@ -432,7 +436,7 @@ export function readDurations(root) {
   const hoursByWeek = {};
   for (const [w, m] of Object.entries(minutesByWeek)) hoursByWeek[w] = round1(m / 60);
   return {
-    bySlug, hoursBySlug, hoursByWeek, total, sessionsTimed,
+    available: true, bySlug, hoursBySlug, hoursByWeek, total, sessionsTimed,
     avgSessionMin: all.length ? Math.round(total / all.length) : null,
     longestSessionMin: all.length ? Math.max(...all) : null,
   };

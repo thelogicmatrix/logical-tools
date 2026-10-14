@@ -218,6 +218,75 @@ test('11d. a repo nested inside home does not write its map into home .runbooks/
   assert.strictEqual(s.topicsRoot, null);
 });
 
+// #132. ~/.runbooks/config.json pins dir to the home store, so worktrees of home do not route
+// their empty copies. Reached only as the home-tier fallback from another repo, that pin hid the
+// repo's own docs/runbooks: actual-projections read and wrote home's store and topics.json.
+function homePinned(t) {
+  const f = fixture(t);
+  const store = mk(f.home, 'docs', 'runbooks');
+  writeConfig(mk(f.home, '.runbooks'), { dir: store, ledger: 'docs/runbooks/.router-ledger.json' });
+  const own = mk(f.project, 'docs', 'runbooks');
+  return { ...f, store, own, s: () => settings({ cwd: f.project, env: f.env, home: f.home }) };
+}
+
+test('12. a home-tier config.dir ranks below the project docs/runbooks', (t) => {
+  const f = homePinned(t);
+  assert.strictEqual(f.s().dir, f.own);
+  // With no runbooks of its own, the repo still gets home's pinned store.
+  rmSync(f.own, { recursive: true });
+  assert.deepStrictEqual([f.s().dir, f.s().ledger], [f.store, join(f.store, '.router-ledger.json')]);
+});
+
+test('12a. home .runbooks/ owns no map and no ledger for the project runbooks it outranked to', (t) => {
+  const f = homePinned(t);
+  assert.strictEqual(f.s().topicsRoot, null);
+  // The purpose ledger is keyed by slug like the topics map, so home's must not take this repo's.
+  assert.strictEqual(f.s().ledger, join(f.own, '.router-ledger.json'));
+});
+
+// The worktrees under C:/dev that carry docs/runbooks are home worktrees on branches from before
+// the store moved out: pre-store copies, not runbooks of their own. A home worktree is home,
+// whatever its branch holds, so it routes the store with home's map and ledger.
+test('12d. a home worktree on an old branch (docs/runbooks, no .runbooks/) resolves as home', (t) => {
+  const f = fixture(t);
+  execFileSync('git', ['init', '-q', f.home]);
+  execFileSync('git', ['-C', f.home, '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '--allow-empty', '-m', 'x']);
+  const homeRoot = mk(f.home, '.runbooks');
+  const store = mk(f.home, 'docs', 'runbooks');
+  writeConfig(homeRoot, { dir: store, ledger: 'docs/runbooks/.router-ledger.json' });
+  const wt = join(f.base, 'old-branch-wt');
+  execFileSync('git', ['-C', f.home, 'worktree', 'add', '-q', '--detach', wt]);
+  mk(wt, 'docs', 'runbooks');
+  const s = settings({ cwd: mk(wt, 'sub'), env: f.env, home: f.home });
+  assert.deepStrictEqual([s.dir, s.topicsRoot, s.ledger], [store, homeRoot, join(store, '.router-ledger.json')]);
+  // With a .runbooks/ of its own (a worktree off today's home), still home's.
+  writeConfig(mk(wt, '.runbooks'), { dir: join(wt, 'docs', 'runbooks') });
+  assert.deepStrictEqual(settings({ cwd: wt, env: f.env, home: f.home }).topicsRoot, homeRoot);
+});
+
+test('12b. a home worktree: its own .runbooks config.dir still beats its empty docs/runbooks copy', (t) => {
+  const f = fixture(t);
+  const store = mk(f.home, 'docs', 'runbooks');
+  writeConfig(mk(f.home, '.runbooks'), { dir: store });
+  const projRoot = mk(f.project, '.runbooks');
+  writeConfig(projRoot, { dir: store });
+  mk(f.project, 'docs', 'runbooks');
+  const s = settings({ cwd: f.project, env: f.env, home: f.home });
+  assert.strictEqual(s.dir, store);
+  assert.strictEqual(s.topicsRoot, projRoot);
+});
+
+test('12c. inside home itself, home .runbooks is the project tier and its config.dir wins', (t) => {
+  const f = fixture(t);
+  execFileSync('git', ['init', '-q', f.home]);
+  const homeRoot = mk(f.home, '.runbooks');
+  const store = mk(f.base, 'store');
+  writeConfig(homeRoot, { dir: store });
+  mk(f.home, 'docs', 'runbooks');
+  const s = settings({ cwd: mk(f.home, 'sub'), env: f.env, home: f.home });
+  assert.deepStrictEqual([s.dir, s.topicsRoot], [store, homeRoot]);
+});
+
 test('STATE_DIR ends in claude-router', () => {
   assert.match(STATE_DIR, /claude-router$/);
 });

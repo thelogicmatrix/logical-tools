@@ -7,11 +7,12 @@
 // away, so the order of output and exit is what it was when this called process.exit itself.
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
+import { hostname } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { firstMeaningfulLine, runGit } from './git.mjs';
 import { readProgress, renderProgress } from './progress.mjs';
-import { displayOrder, parseFlags, resolveEntry, userVisible } from './view.mjs';
+import { displayOrder, nowIso, parseFlags, resolveEntry, userVisible } from './view.mjs';
 // Fallback sync target, used only when the branch has no upstream - the reasoning lives at
 // syncTarget() below, beside the code that consults it.
 const SYNC_REMOTE = process.env.GTG_SYNC_REMOTE || 'origin'; // fallback only: the hub's mirror
@@ -21,6 +22,9 @@ const SYNC_BRANCH = process.env.GTG_SYNC_BRANCH || 'main';   // fallback only: t
 // migration itself - and is kept because it is what makes the call idempotent for any future
 // caller: a second fetch costs another 5-second timeout with the hub unreachable.
 let synced = false;
+// The machine a handoff is written on, recorded so a resume elsewhere can say where its worktree is.
+// A container reports its own hostname, which is the container id unless it was started with one.
+export const thisDevice = () => hostname().toLowerCase();
 const FETCH_FRESH_MS = 60000;
 
 // Fast-forward the hub from whatever it tracks before anything reads the store. POSITION IS THE WHOLE
@@ -113,9 +117,11 @@ export function syncHub(root) {
 export async function resumeConsume(argv, ctx) {
   const a = parseFlags(argv);
   const t = argv.find((x) => !x.startsWith('--'));
-  // Before the two reads below, deliberately. See syncHub: after them it is decoration.
-  // Not on the forge store, which is already the one shared copy.
-  if (!ctx.forge) syncHub(ctx.root);
+  // Before the reads below, deliberately. See syncHub: after them it is decoration.
+  // On the forge store too (4.5.0): the forge holds records and handoffs, but the progress record
+  // (which supersedes the handoff snapshot) and the portfolio rows the after-resume hook flips are
+  // still files in the hub's git, as stale as the last scheduled pull without this.
+  syncHub(ctx.root);
   const act = ctx.entries('active');
   const bl = ctx.entries('backlog');
   let match = null;
@@ -161,6 +167,18 @@ export async function resumeConsume(argv, ctx) {
     }
   }
   ctx.onPick(match.slug);
+  // A resume touches the entry, so no later session calls it stale. `resumedAt`, not `updated`: list's
+  // age stays the last handoff. A stale forge read has no hub copy to write to, so it skips the stamp.
+  // Touched within the day, the stamp would change nothing the review reads, so it costs no write.
+  const seen = Math.max(...['updated', 'reviewed', 'resumedAt'].map((k) => Date.parse(match[k]) || 0));
+  if (!ctx.forge?.stale && Date.now() - seen >= 864e5) {
+    try {
+      match.resumedAt = nowIso();
+      ctx.commit(ctx.saveEntries(fromBacklog ? 'backlog' : 'active', fromBacklog ? bl : act), `gtg resumed: ${match.project}`);
+    } catch (e) {
+      console.error(`gtg: resume not recorded - ${firstMeaningfulLine(e)}`);
+    }
+  }
   const file = match.file ? join(ctx.root, match.file) : null;
   const body = ctx.forge ? await ctx.forge.latestHandoff(match)
     : file && existsSync(file) ? readFileSync(file, 'utf8').trim() : null;
@@ -168,6 +186,13 @@ export async function resumeConsume(argv, ctx) {
   const when = typeof match.updated === 'string' ? match.updated.slice(0, 16).replace('T', ' ') : '?';
   const where = ctx.forge ? ctx.forge.locationOf(match) : match.file;
   console.log(`RESUME: "${match.project}" - handoff of ${when}${where ? ` (${where})` : ''}`);
+  // A worktree path only exists on the machine that made it (2026-10-02: a desktop path resumed on
+  // the laptop, found out by a failed cd). Said here, on the line after RESUME, before the body is read.
+  if (match.worktree && match.worktree !== 'repo root' && !existsSync(match.worktree)) {
+    const here = thisDevice();
+    const from = match.device && match.device !== here ? ` The handoff was written on ${match.device}.` : '';
+    console.log(`Worktree ${match.worktree} is not on this device (${here}).${from}`);
+  }
   if (progress) {
     console.log(`CURRENT PROGRESS (supersedes handoff snapshot)\n${renderProgress(progress)}`);
   }

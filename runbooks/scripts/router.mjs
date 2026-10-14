@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// UserPromptSubmit: inject only the runbooks this prompt actually needs.
+// UserPromptSubmit and PreToolUse Agent|Task: inject the runbooks this task needs.
 //
 // WHAT IT REPLACES. index.mjs distinguishes PULLED procedures (a slug routes you: you
 // already know you are deploying the app) from PUSHED standards and references (nothing about the
@@ -171,6 +171,18 @@ export function failNotice(why, attempts = 1) {
     + 'Treat the absence as unknown, not as "nothing applies".\n'
     + 'If this task touches a procedure, a standard or a stored fact, read the runbooks folder '
     + 'directly before starting.';
+}
+
+// LOUD FAILURES. The notice above reaches only the model, which reads past it, so a missing key
+// once left a whole device without routing for a day. A failure no retry or wait can fix (no key,
+// a rejected key, no credits) also goes to the user as a systemMessage on every prompt until fixed.
+// Transient failures stay quiet: the outage breaker already handles them.
+export const isLoud = (why) => why === 'no key' || /^http 40[123]$/.test(String(why));
+export function loudMessage(why) {
+  const fix = why === 'no key'
+    ? 'set OPENROUTER_KEY_RUNBOOKS in ~/.jev.env or the environment'
+    : 'check the OpenRouter key and its credits';
+  return `Runbook routing is down (${why}): no runbooks reach this session until you ${fix}.`;
 }
 
 // Freshness. The age rides the injected line only. The model never sees it, so routing scores
@@ -449,7 +461,14 @@ if (isMain(import.meta.url)) {
   // index.mjs's read, with its 500 ms deadline. `for await` over stdin waited for an EOF that a
   // caller holding the pipe open never sends, and the hook hung until the harness killed it.
   const input = await readInput();
-  const prompt = typeof input.prompt === 'string' ? input.prompt : '';
+  const agent = process.argv.includes('--agent');
+  const json = process.argv.includes('--json');
+  // PreToolUse sees the parent's session, before the child has an agent_id. Append to the
+  // dispatch brief itself: additionalContext here would go to the parent, not the child.
+  const field = json ? 'message' : 'prompt';
+  if (agent && (!['Agent', 'Task', 'spawn_agent'].includes(input?.tool_name)
+    || typeof input?.tool_input?.[field] !== 'string' || !input.tool_input[field].trim())) process.exit(0);
+  const prompt = agent ? input.tool_input[field] : typeof input.prompt === 'string' ? input.prompt : '';
   const sessionId = input.session_id ?? '';
   const cwd = typeof input.cwd === 'string' ? input.cwd : process.cwd();
 
@@ -461,7 +480,12 @@ if (isMain(import.meta.url)) {
   if (!cfg.dir) process.exit(0);
 
   // Second copy of this hook on the same prompt. Exit before the API call, not after it.
-  if (prompt && !claimPrompt(sessionId, prompt)) process.exit(0);
+  // Each child needs its own context, even with the same brief as the parent or another child.
+  // A tool id dedupes duplicate registrations for ONE dispatch. Without one, route every child.
+  const dedupeScope = agent
+    ? (sessionId && input.tool_use_id ? `${sessionId}\0dispatch\0${input.tool_use_id}` : null)
+    : sessionId;
+  if (prompt && dedupeScope !== null && !claimPrompt(dedupeScope, prompt)) process.exit(0);
 
   const books = loadAll(cfg.dir);
   if (!books.length) process.exit(0);
@@ -473,12 +497,25 @@ if (isMain(import.meta.url)) {
       spend: { activity: 'active_route', session: sessionId } });
   if (tripsBreaker(r)) markOutage();
   // So the skill and action triggers do not hand this conversation the same runbook again.
-  if (r.files?.length) claimRunbooks(scopeOf(input), r.files);
+  // The future child's id is unknown here; recording this in the parent's ledger would wrongly
+  // suppress runbooks the parent has never received. Child skill/action hooks keep their own scope.
+  if (!agent && r.files?.length) claimRunbooks(scopeOf(input), r.files);
   const { text, mode, why, hits, attempts } = r;
   // Claude Code takes plain stdout as context. Codex reads only the JSON envelope and drops
   // anything else on the floor, silently, which looks exactly like a router that found no match.
   // Same routing, same corpus, one flag: --json is the whole Codex port.
-  if (text) console.log(process.argv.includes('--json') ? JSON.stringify(codexEnvelope(text)) : text);
+  // ponytail: Claude Code prompts only. Codex (--json) and subagent dispatches keep their quiet
+  // shapes; the parent prompt has already warned. Add systemMessage there if Codex is seen to show it.
+  if (text && !agent && !json && mode === 'fallback' && isLoud(why)) {
+    console.log(JSON.stringify({ systemMessage: loudMessage(why),
+      hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: text } }));
+  } else if (text) console.log(agent ? JSON.stringify({ hookSpecificOutput: {
+    hookEventName: 'PreToolUse',
+    // Codex requires allow alongside updatedInput. Claude accepts the rewrite independently,
+    // so leave its permission evaluation untouched.
+    ...(json ? { permissionDecision: 'allow' } : {}),
+    updatedInput: { ...input.tool_input, [field]: `${prompt}\n\n${text}` },
+  } }) : json ? JSON.stringify(codexEnvelope(text)) : text);
   // One line so a fallback is visible rather than silent: if this says "fallback" every time, the
   // router is costing latency and buying nothing. It prints even when the injection is empty,
   // because a zero-hit result is still a call that happened and still cost the attempts it names.

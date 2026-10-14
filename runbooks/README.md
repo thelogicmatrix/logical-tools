@@ -47,7 +47,13 @@ The router is one of three. The other two watch what the agent does instead of w
 
 Each one injects a path and a purpose line. The agent reads the file when it needs it.
 
-The skill and command triggers run in Claude Code only for now. Codex gets the prompt router.
+The skill and command triggers run in Claude Code only for now. Both Claude Code and Codex get prompt routing. Native subagent routing is verified in Claude Code; Codex has the measured gap below.
+
+**Subagents.** Before an `Agent` or `Task` dispatch in Claude Code, the router scores the child's `prompt` and appends matched runbooks through `PreToolUse.updatedInput`. Every other dispatch argument is preserved. Each dispatch has its own dedupe scope, so a parent or another child receiving the same runbook cannot suppress this child's context. If routing fails, the brief receives the usual failure notice and dispatch continues. The same shortlist, score threshold, retry budget, outage breaker and spend receipts apply. Codex's adapter is tested offline with a plaintext `spawn_agent.message` and JSON rewrite contract; those tests do not establish delivery across the encrypted native boundary.
+
+The hook contracts follow the [Claude Code hooks reference](https://code.claude.com/docs/en/hooks#pretooluse-decision-control) and [Codex hooks guide](https://developers.openai.com/codex/hooks). Codex requires trusted hooks and its `hooks` feature enabled; its rewrite contract requires `permissionDecision: "allow"` alongside `updatedInput`. Claude's rewrite leaves the permission decision unset.
+
+Verified on 2026-10-01: Claude Code 2.1.286 delivered a live match at 0.90 in a child's first prompt using the production 0.8 threshold and a temporary runbook fixture; parent prompt routing also delivered its match. A fresh codex-cli 0.159.3 capture reported native `PreToolUse.tool_name` as `collaborationspawn_agent` with an encrypted `message`, while `SubagentStart` supplied no task text. The router rejects that native name; allowing it alone would still leave no plaintext task to score and no safe place to append runbooks. Native Codex first-turn delivery remains a measured gap pending supported plaintext hook input.
 
 **Skills.** A skill names topics in its own words, so it works on any host whatever its runbooks are called:
 
@@ -78,7 +84,7 @@ codex plugin add runbooks@logical-tools       # Codex
 
 Codex may ask you to trust the plugin's hooks once before they fire.
 
-You need Node 20 or later and an OpenRouter key. The plugin reads the key from `OPENROUTER_API_KEY`, then from a line `OPENROUTER_API_KEY=...` in `~/.jev.env`. It has no other dependencies.
+You need Node 20 or later and an OpenRouter key. The plugin reads the key from `OPENROUTER_KEY_RUNBOOKS` in the environment, then from that line in `~/.jev.env`, then falls back to `OPENROUTER_API_KEY` in the same two places. A key of its own per consumer keeps its spend separate in OpenRouter. It has no other dependencies.
 
 ## Where your runbooks live
 
@@ -88,6 +94,8 @@ The plugin uses the first of these folders that exists:
 2. `dir` in `.runbooks/config.json`
 3. `docs/runbooks/` at the git top of the working directory
 4. `~/docs/runbooks/`
+
+A `dir` in `~/.runbooks/config.json` read from another repo ranks below that repo's own `docs/runbooks/`, so a home-wide pin does not hide a project's runbooks. Home and every worktree of home, found through its `.git` file, count as home on any branch, so they route the pinned store, not a stale copy an old branch carries.
 
 With no folder found, the plugin does nothing, so installing it in a repo without runbooks costs nothing.
 
@@ -123,6 +131,7 @@ Change the thresholds, add your own session-start lines, lint rules and writing 
 - It injects each match by name, type and purpose.
 - Retries fit inside a 4 second total budget. Only a timeout, a 5xx, a 429 or a network error is retried. When all of them fail, the router skips the API for 60 seconds and injects the notice straight away.
 - A failure (no key, no network, a timeout, a bad response) injects a short notice saying routing is unavailable, why, and to read the runbooks folder directly.
+- A failure that will not fix itself (no key, a rejected key, no credits: HTTP 401, 402 or 403) also shows you a warning on every Claude Code prompt until it is fixed, so routing can't stay down unnoticed. Transient failures stay quiet.
 - Once a key is set, a prompt under 12 characters, like "ok" or "yes", injects nothing. With no key, the failure notice fires on every prompt.
 - A second copy of the hook on the same prompt exits before the API call.
 - Spend, dedupe and outage logs go to `%LOCALAPPDATA%/claude-router/` on Windows and `~/.local/state/claude-router/` elsewhere.

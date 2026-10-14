@@ -1,8 +1,10 @@
 # logical-tools: Mouldable AI tool frameworks
 
-Nine bespoke plugins covering fundamental tools to create cohesive AI workflows, and each modifiable to your specific needs. Built to retain your custom behaviour between updates, while balancing performance, efficiency and cost. 
+Eight bespoke plugins covering fundamental tools to create cohesive AI workflows, and each modifiable to your specific needs. Built to retain your custom behaviour between updates, while balancing performance, efficiency and cost. 
 
 By [Nathan Wong](https://github.com/thelogicmatrix).
+
+**New here?** [WORKFLOW.md](WORKFLOW.md) shows how the plugins fit into a working day, and the habits behind them you can use without installing anything. Or point your AI at this repo and ask it what to take from it. [AGENTS.md](AGENTS.md) tells it how to answer.
 
 ## Install
 
@@ -21,6 +23,12 @@ codex plugin add gtg@logical-tools
 ```
 
 Swap `gtg` for any plugin name below. Both harnesses run the same source, not copied ports. Most plugins are also a plain skill folder you can copy into `.claude/skills/` for a frozen copy that never updates.
+
+Each plugin's README lists what it needs. Most need only Node 18 or later and git. runbooks and jevtools also need an OpenRouter key, and postman needs Python and a Gmail app password. Not sure where to start? gtg and runbooks give the most for the least setup.
+
+### Recommended setup
+
+[T3 Code](https://t3.codes) runs Claude Code and Codex threads side by side, on one machine or several, and it is how these plugins are used day to day. `gtg refresh` and `gtg migrate`, which restart a session in a fresh thread here or on another machine, need it. Everything else works in Claude Code or Codex alone.
 
 ## The plugins
 
@@ -52,13 +60,13 @@ Reads a question's sources, or a whole channel, book or doc set, in full, and wr
 
 ## How extending works
 
-Every plugin has the same three layers.
+Most plugins have the same three layers. postman is the exception: its identities live in `~/.postman` in your home folder, not in a repo.
 
 | Layer | Where | Updates? |
 |---|---|---|
 | Core | the plugin | ships and updates with the plugin |
 | Bundled defaults | the plugin | on by default, update with the plugin |
-| Yours | a dot-folder in your repo (`.gtg/`, `.dd/`, `.lr/`, `.learn/`, `.postman/`, `.runbooks/`) | never touched by updates |
+| Yours | a dot-folder in your repo (`.gtg/`, `.dd/`, `.lr/`, `.learn/`, `.runbooks/`) | never touched by updates |
 
 The plugin only reads your folder, so an update cannot overwrite your changes.
 

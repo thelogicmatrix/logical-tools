@@ -10,10 +10,12 @@ test('the report separates attributable calls from legacy and external spend', (
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const calls = join(dir, 'calls.jsonl');
   const legacy = join(dir, 'legacy.jsonl');
+  // Today, so the log stays a partial first day whenever the test runs.
+  const day = new Date().toISOString().slice(0, 10);
   writeFileSync(calls, [
-    { t: '2026-09-29T06:00:00Z', tool: 'runbooks', activity: 'active_route', session: 's1', cost: 0.0002 },
-    { t: '2026-09-29T06:01:00Z', tool: 'runbooks', activity: 'purpose_test', session: 's1', target: 'a.md', cost: 0.0001 },
-    { t: '2026-09-29T06:02:00Z', tool: 'jevmail', activity: 'tool', session: null, cost: null },
+    { t: `${day}T06:00:00Z`, tool: 'runbooks', activity: 'active_route', session: 's1', cost: 0.0002 },
+    { t: `${day}T06:01:00Z`, tool: 'runbooks', activity: 'purpose_test', session: 's1', target: 'a.md', cost: 0.0001 },
+    { t: `${day}T06:02:00Z`, tool: 'jevmail', activity: 'tool', session: null, cost: null },
   ].map(JSON.stringify).join('\n') + '\n');
   writeFileSync(legacy, '{"t":"2026-09-28T00:00","c":0.003}\n');
   const stdout = execFileSync(process.execPath, [join(import.meta.dirname, 'spend-report.mjs'), '--json'],

@@ -1,11 +1,11 @@
 {
   "name": "gtg",
-  "version": "4.4.2",
+  "version": "4.9.1",
   "description": "Pause/resume workflow for Claude Code sessions.",
   "type": "module",
   "private": true,
   "scripts": {
-    "_test-note": "A GLOB, not a hand-listed set of legs. The list version silently skipped a whole suite once: Task 1's 15 store cases were written, committed and never run because nobody remembered to add them here. The glob picks up every test/*.test.mjs, so a new suite runs the day it lands. The assert-based suites (gtg, issues) run under it too - a plain script that throws exits non-zero and the runner reports it as a failed file. A bare directory argument does NOT work on Node 24 (it is resolved as a module), hence the glob. --test-concurrency=1 because gtg.test.mjs spawns the CLI against ~70 throwaway git repos and running it beside the others tripled the wall clock.",
-    "test": "node --test --test-concurrency=1 \"test/*.test.mjs\""
+    "_test-note": "A GLOB, not a hand-listed set of legs. The list version silently skipped a whole suite once: Task 1's 15 store cases were written, committed and never run because nobody remembered to add them here. The glob picks up every test/*.test.mjs, so a new suite runs the day it lands. The assert-based suites (gtg, issues) run under it too - a plain script that throws exits non-zero and the runner reports it as a failed file. A bare directory argument does NOT work on Node 24 (it is resolved as a module), hence the glob. No --test-concurrency=1: the CLI cases are split across test/gtg-part*.test.mjs so the files run side by side. Serial, the suite took 178 s; one gtg.test.mjs took 97 s alone and 113 s beside the others (#128). A new CLI case goes in the shortest part.",
+    "test": "node --test \"test/*.test.mjs\""
   }
 }

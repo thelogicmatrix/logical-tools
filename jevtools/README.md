@@ -25,7 +25,7 @@ Add the logical-tools marketplace as the [root README](../README.md) shows, then
 codex plugin add jevtools@logical-tools       # Codex
 ```
 
-You need Node 20 or later and an OpenRouter key, read from `OPENROUTER_API_KEY` or from a line `OPENROUTER_API_KEY=...` in `~/.jev.env`. jevmail's search also needs Python and the postman plugin in the same logical-tools checkout.
+You need Node 20 or later and an OpenRouter key, read from `OPENROUTER_KEY_JEVTOOLS` in the environment or `~/.jev.env`, with `OPENROUTER_API_KEY` in either place as the fallback. jevmail's search also needs Python and the postman plugin installed. It runs the newest postman in your Claude Code or Codex plugin cache, or the `postman.py` that `POSTMAN_PY` names, and stops with the install command when neither is there.
 
 ## Commands
 

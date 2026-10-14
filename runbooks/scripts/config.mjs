@@ -42,11 +42,15 @@ const fromRoot = (root, p) => (isAbsolute(p) || !root ? resolve(p) : resolve(dir
 
 // A relative RUNBOOKS_DIR resolves from the cwd argument, not the process cwd, which for a hook is
 // wherever the harness happened to start it.
+// A config.dir pins the store so worktrees of a repo do not route their empty copies. Read from
+// ~/.runbooks as the fallback for another repo, that pin would hide the repo's own docs/runbooks,
+// so there it ranks below them (#132).
 function dirFrom({ cwd, project, root, config, env, home }) {
+  const named = typeof config.dir === 'string' && config.dir && fromRoot(root, config.dir);
+  const own = join(project, 'docs', 'runbooks');
   const candidates = [
     [env.RUNBOOKS_DIR && resolve(cwd, env.RUNBOOKS_DIR), 'named'],
-    [typeof config.dir === 'string' && config.dir && fromRoot(root, config.dir), 'named'],
-    [join(project, 'docs', 'runbooks'), 'found'],
+    ...(homeTier(root, project, home) ? [[own, 'found'], [named, 'named']] : [[named, 'named'], [own, 'found']]),
     [join(home, 'docs', 'runbooks'), 'found'],
   ];
   const hit = candidates.find(([p]) => p && isDir(p));
@@ -63,9 +67,30 @@ function ownsDir(root, dir, from) {
   return from === 'named' || resolve(dir) === resolve(dirname(root), 'docs', 'runbooks');
 }
 
+// ~/.runbooks reached from a repo other than home itself.
+const homeTier = (root, project, home) =>
+  Boolean(root) && resolve(root) === resolve(home, '.runbooks') && resolve(project) !== resolve(home);
+
+// A worktree of home is home, on any branch. The ones under C:/dev that carry docs/runbooks are on
+// branches from before the store moved out, so that folder is a stale copy, not runbooks of their
+// own. Read from the .git file and commondir rather than a git spawn, because this runs on every
+// prompt. A .git folder means a repo of its own; a .git file with no commondir is a submodule.
+const samePath = (a, b) => (process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b);
+function isHomeWorktree(project, home) {
+  try {
+    const m = /^gitdir:\s*(.+?)\s*$/m.exec(readFileSync(join(project, '.git'), 'utf8'));
+    if (!m) return false;
+    const gitdir = resolve(project, m[1]);
+    const common = resolve(gitdir, readFileSync(join(gitdir, 'commondir'), 'utf8').trim());
+    return samePath(common, resolve(home, '.git'));
+  } catch { return false; }
+}
+
 function resolveAll({ cwd = process.cwd(), env = process.env, home = homedir() } = {}) {
-  const project = projectRoot(cwd);
-  const root = rootFrom(project, cwd, home);
+  const top = projectRoot(cwd);
+  const asHome = isHomeWorktree(top, home);
+  const project = asHome ? resolve(home) : top;
+  const root = asHome ? rootFrom(project, project, home) : rootFrom(project, cwd, home);
   const config = loadConfig(root);
   const { dir, from } = dirFrom({ cwd, project, root, config, env, home });
   return { root, config, dir, topicsRoot: ownsDir(root, dir, from) ? root : null };
@@ -83,7 +108,9 @@ export function settings(opts) {
   const firesAt = num(config.firesAt, DEFAULTS.firesAt);
   // A writeBar under firesAt would pass a purpose the router never fires on, so it falls back too.
   const writeBar = num(config.writeBar, -Infinity);
-  const ledger = typeof config.ledger === 'string' && config.ledger
+  // A ledger is keyed by slug like the topics map, so a .runbooks/ that does not own the runbooks
+  // in use does not get their entries either.
+  const ledger = topicsRoot && typeof config.ledger === 'string' && config.ledger
     ? fromRoot(root, config.ledger)
     : dir && join(dir, '.router-ledger.json');
   return {

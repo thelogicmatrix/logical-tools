@@ -233,7 +233,7 @@ export async function openForge(cfg, fetchImpl = fetch) {
   // Forgejo on 2026-09-29: a stale sha is 409 on PUT but 400 on DELETE, a POST over an existing
   // file is 422, and a PUT to a path another session deleted is 500 (lost, then read back).
   const REFUSED = new Set([400, 409, 422]);
-  const write = async (method, path, payload, want, oldSha, limit = 2) => {
+  const write = async (method, path, payload, want, oldSha, limit = 2, createOnly = false) => {
     // Stale data never feeds a write. The dispatcher refuses writes up front, this is the backstop.
     if (read.stale) throw new Error('the hub is unreachable and this command read the cached store (stale), so nothing was written. Re-run it when the hub is back');
     for (let sends = 1; ; sends++) {
@@ -253,6 +253,9 @@ export async function openForge(cfg, fetchImpl = fetch) {
       try { now = await current(path); } catch (e) {
         throw new Error(`${err.message}, and reading it back failed${lost ? ', so the write may have landed' : ''} - ${e.message}`);
       }
+      // A definite rejected create belongs to another writer, even when the bytes match.
+      // A lost answer can still be proven landed by the existing exact read-back protocol.
+      if (createOnly && !lost && now) throw new Error('project slug already exists; create-only did not overwrite it');
       if (want === null ? !now : now && JSON.stringify(now.rec) === want) return { sha: now?.sha, url: now?.url };
       if ((now?.sha ?? null) === (oldSha ?? null)) {
         if (lost && sends < limit) continue;
@@ -273,12 +276,15 @@ export async function openForge(cfg, fetchImpl = fetch) {
   });
   const saved = new Map(loaded.map(({ rec, sha, fileSlug }) => [fileSlug, { rec: JSON.stringify(rec), sha }]));
   const bodyBySlug = new Map(loaded.map(({ rec, fileSlug }) => [fileSlug, rec.handoff]));
+  const storedBySlug = new Map(loaded.map(({ rec, fileSlug }) => [fileSlug, rec]));
   const entry = (rec, fileSlug) => { const { handoff, ...rest } = rec; return { ...rest, file: undefined, [sourceSlug]: fileSlug }; };
   const shelves = {
     active: loaded.filter(({ rec }) => rec.shelf === 'active').map(({ rec, fileSlug }) => entry(rec, fileSlug)),
     backlog: loaded.filter(({ rec }) => rec.shelf === 'backlog').map(({ rec, fileSlug }) => entry(rec, fileSlug)),
   };
   const pending = new Map();
+  const handoffGuards = new Map();
+  const requiredAbsent = new Set();
   let failedHandoff = false;
   return {
     // When the read came from the local cache because the hub was unreachable: the time of that
@@ -292,9 +298,20 @@ export async function openForge(cfg, fetchImpl = fetch) {
       });
       return [];
     },
-    queueHandoff(slug, body) { pending.set(slug, body); },
+    queueHandoff(slug, body, { createOnly = false, expectedBodySha256, expectedShelf } = {}) {
+      pending.set(slug, body);
+      if (createOnly) requiredAbsent.add(slug);
+      if (expectedBodySha256) handoffGuards.set(slug, { hash: expectedBodySha256, shelf: expectedShelf });
+    },
     locationOf: (rec) => `${records}${rec[sourceSlug] ?? rec.slug}.json`,
     async latestHandoff(rec) { return bodyBySlug.get(rec[sourceSlug] ?? rec.slug)?.trim() ?? null; },
+    // The record as the hub held it when this command read it, every field and the handoff byte for
+    // byte, for list --json and show. entries() blanks `file` for the writers and latestHandoff trims
+    // for resume, and neither may change what these print. A copy, so a caller cannot edit the read.
+    stored(rec) {
+      const r = storedBySlug.get(rec[sourceSlug] ?? rec.slug);
+      return r ? structuredClone(r) : null;
+    },
     async flush(verb) {
       if (failedHandoff) throw new Error('handoff write failed earlier in this command');
       const urls = [];
@@ -307,6 +324,8 @@ export async function openForge(cfg, fetchImpl = fetch) {
         const rec = { ...item, shelf };
         delete rec.file;
         const slug = rec.slug;
+        const createOnly = requiredAbsent.has(slug);
+        if (createOnly && (item[sourceSlug] || saved.has(slug))) throw new Error('project slug already exists; create-only did not overwrite it');
         let fileSlug = item[sourceSlug] ?? slug;
         if (!item[sourceSlug]) for (let n = 2; saved.has(fileSlug); n++) fileSlug = `${slug}-${n}`;
         const body = pending.get(slug) ?? bodyBySlug.get(fileSlug);
@@ -326,8 +345,15 @@ export async function openForge(cfg, fetchImpl = fetch) {
         let out;
         let final = rec;
         try {
-          out = await write(old ? 'PUT' : 'POST', path, payload(rec, old?.sha), serialized, old?.sha);
+          out = await write(old ? 'PUT' : 'POST', path, payload(rec, old?.sha), serialized, old?.sha, 2, createOnly);
           if ('theirs' in out) {
+            if (createOnly) throw new Error(`${slug} changed in another session; create-only did not overwrite it`);
+            const guard = handoffGuards.get(slug);
+            if (guard && (!out.theirs || out.theirs.rec.shelf !== guard.shelf
+              || typeof out.theirs.rec.handoff !== 'string'
+              || createHash('sha256').update(out.theirs.rec.handoff, 'utf8').digest('hex') !== guard.hash)) {
+              throw new Error('guarded handoff changed or was removed while this command ran; nothing was overwritten');
+            }
             const { merged, clash = [] } = old && out.theirs ? reapply(JSON.parse(old.rec), rec, out.theirs.rec) : {};
             if (!merged) throw new Error(`${slug} changed in another session while this command ran${clash.length ? ` (both changed ${clash.join(', ')})` : ''}. Re-run it`);
             if (!shelves[merged.shelf]) throw new Error(`invalid gtg record at ${path} after another session's edit`);
@@ -338,6 +364,8 @@ export async function openForge(cfg, fetchImpl = fetch) {
           }
         } catch (e) { if (pending.has(slug)) failedHandoff = true; throw e; }
         saved.set(fileSlug, { rec: JSON.stringify(final), sha: out.sha });
+        requiredAbsent.delete(slug);
+        handoffGuards.delete(slug);
         bodyBySlug.set(fileSlug, final.handoff);
         item[sourceSlug] = fileSlug;
         // Re-applied: the entry takes their fields too, so a second flush finds nothing to write.
@@ -362,4 +390,4 @@ export async function openForge(cfg, fetchImpl = fetch) {
       return urls;
     },
   };
-}
+}

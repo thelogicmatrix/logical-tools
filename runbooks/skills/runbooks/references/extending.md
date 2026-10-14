@@ -21,6 +21,11 @@ The first of these that exists as a folder wins. A missing candidate is skipped.
 3. `docs/runbooks/` at the git top of the working directory
 4. `~/docs/runbooks/`
 
+When the `.runbooks/` in use is `~/.runbooks/` reached from a repo other than home, 2 and 3 swap:
+the repo's own `docs/runbooks/` beats home's `dir`, and home's `ledger` and topics map do not apply
+to it. Home and every worktree of home (its `.git` file points at home's `.git`) count as home
+on any branch, so an old branch's `docs/runbooks/` copy never wins over the store.
+
 With none found, every hook prints nothing, and the lint and `check.mjs` exit with an error.
 
 ## 1. `config.json`

@@ -10,9 +10,9 @@ const json = (...p) => JSON.parse(fs.readFileSync(path.join(PLUGIN, ...p), 'utf8
 test('the Claude hooks name scripts that exist, on the events this plugin uses', () => {
   const { hooks } = json('hooks', 'hooks.json');
   assert.deepEqual(Object.keys(hooks).sort(), ['PostCompact', 'PreToolUse', 'SessionStart', 'UserPromptSubmit']);
-  assert.deepEqual(hooks.PreToolUse.map((h) => h.matcher), ['Skill', 'Bash|PowerShell']);
+  assert.deepEqual(hooks.PreToolUse.map((h) => h.matcher), ['Agent|Task', 'Skill', 'Bash|PowerShell']);
   const commands = Object.values(hooks).flat().flatMap((g) => g.hooks.map((h) => h.command));
-  assert.equal(commands.length, 5);
+  assert.equal(commands.length, 6);
   for (const c of commands) {
     const m = /^node "\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/([a-z]+\.mjs)"( --[a-z]+)?$/.exec(c);
     assert.ok(m, c);
@@ -24,10 +24,13 @@ test('the Claude hooks name scripts that exist, on the events this plugin uses',
 });
 
 test('both manifests carry the same version', () => {
-  assert.equal(json('.claude-plugin', 'plugin.json').version, '1.4.3');
-  assert.equal(json('.codex-plugin', 'plugin.json').version, '1.4.3');
+  assert.match(json('.claude-plugin', 'plugin.json').version, /^\d+\.\d+\.\d+$/);
+  assert.equal(json('.codex-plugin', 'plugin.json').version, json('.claude-plugin', 'plugin.json').version);
 });
 
-test('the Codex hooks are unchanged: no PreToolUse is registered there yet', () => {
-  assert.deepEqual(Object.keys(json('.codex-plugin', 'hooks.json').hooks).sort(), ['SessionStart', 'UserPromptSubmit']);
+test('Codex dispatch uses the Agent alias and its JSON rewrite contract', () => {
+  const { hooks } = json('.codex-plugin', 'hooks.json');
+  assert.deepEqual(Object.keys(hooks).sort(), ['PreToolUse', 'SessionStart', 'UserPromptSubmit']);
+  assert.equal(hooks.PreToolUse[0].matcher, 'Agent|spawn_agent');
+  assert.equal(hooks.PreToolUse[0].hooks[0].command, 'node "${PLUGIN_ROOT}/scripts/router.mjs" --agent --json');
 });

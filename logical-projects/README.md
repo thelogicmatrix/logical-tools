@@ -41,7 +41,7 @@ Add the logical-tools marketplace as the [root README](../README.md) shows, then
 codex plugin add logical-projects@logical-tools       # Codex
 ```
 
-You need Node 18 or later. It has no other dependencies. The write-guard hook is wired for Claude Code only.
+You need Node 18 or later and git. It has no other dependencies. The write-guard hook is wired for Claude Code only.
 
 ## Where things live
 
@@ -77,6 +77,22 @@ What each `sync` flag means is in [sync.md](skills/logical-projects/references/s
 ## Extend it
 
 No extension point yet, deliberately. A seam nothing needs would be speculative.
+
+## Shared store across machines
+
+Keep a dedicated private repository with the usual `docs/projects/` layout. Set `PROJECTS_ROOT`
+to its checkout root, or write `{"root":"/absolute/checkout/path"}` to `~/.projects/store.json`.
+The file works for a desktop process that was started before the variable was set. The variable
+takes precedence. A `.projects-store.json` containing `{"version":1}` at the checkout root opts
+into two-way synchronization with `origin/main`; an ordinary local portfolio keeps its behavior.
+
+Every CLI invocation refreshes a shared checkout. Its own post-commit hook pushes committed
+changes in the background. Run `node skills/logical-projects/store-sync.mjs <checkout-root>`
+from this plugin for scheduled sync; this is separate from the existing `projects sync` reality check.
+Sync merges disjoint edits, regenerates a conflicting generated index, and aborts real source
+conflicts. Offline and uncommitted work stays local. Exceptions go to `.git/projects-sync.log`
+and are reported by the CLI. Existing custom commit hooks are preserved; use the schedule for
+those narrative commits. Checkouts must be on `main`, with an existing Git identity and credentials.
 
 ## Details
 

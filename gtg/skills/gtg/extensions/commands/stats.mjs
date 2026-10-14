@@ -24,6 +24,7 @@ export default ({ root }) => {
       (h.byHour.some((n) => n) ? ` · peak ${peakHour}:00` : ''));
   }
   const e = r.effort;
+  if (!e.available) console.log('effort unavailable: the git duration history failed, so timed effort is unknown');
   if (e.sessionsTimed) {
     const hm = (m) => (m >= 60 ? `${Math.floor(m / 60)}h${String(m % 60).padStart(2, '0')}` : `${m}m`);
     console.log(`⌛ ${Math.round(e.total / 60)}h timed across ${e.sessionsTimed} sessions` +

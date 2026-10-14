@@ -37,7 +37,8 @@
 
 import fs from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import os from 'node:os';
+import path from 'node:path';
 import { CONCURRENCY, askJev, firedTags, isMain, noulsFrom, parseArgs, readKey, runPool, runSelftest } from './lib.mjs';
 
 // The tag vocabulary. Adding one is nearly free (12 questions cost the same as 1, measured), so the
@@ -179,7 +180,45 @@ export function checkIdentity(identity) {
   return id;
 }
 
-const POSTMAN = fileURLToPath(new URL('../../postman/skills/postman/postman.py', import.meta.url));
+// postman.py comes from postman's own install, never a sibling folder: an installed jevtools has
+// no postman beside it (#126). POSTMAN_PY first, then the newest postman in a Claude Code or Codex
+// plugin cache (<config>/plugins/cache/<marketplace>/postman/<version>/). Resolved when a search
+// runs, so tag mode and a refused identity never look.
+const POSTMAN_PY = ['skills', 'postman', 'postman.py'];
+const isFile = (p) => { try { return fs.statSync(p).isFile(); } catch { return false; } };
+const subdirs = (d) => { try { return fs.readdirSync(d, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name); } catch { return []; } };
+// Numeric segments, so 1.1.10 beats 1.1.9. A folder with no number sorts below every version.
+const versionKey = (v) => (String(v).match(/\d+/g) ?? []).map(Number);
+const byVersion = (a, b) => {
+  const [x, y] = [versionKey(a), versionKey(b)];
+  for (let i = 0; i < Math.max(x.length, y.length); i++) if ((x[i] ?? -1) !== (y[i] ?? -1)) return (x[i] ?? -1) - (y[i] ?? -1);
+  return 0;
+};
+
+export function findPostman({ env = process.env, home = os.homedir() } = {}) {
+  if (env.POSTMAN_PY) {
+    if (isFile(env.POSTMAN_PY)) return env.POSTMAN_PY;
+    throw new Error(`POSTMAN_PY is set to ${env.POSTMAN_PY}, which is not a file.`);
+  }
+  const configs = [...new Set([env.CLAUDE_CONFIG_DIR, path.join(home, '.claude'), env.CODEX_HOME || path.join(home, '.codex')]
+    .filter(Boolean).map((d) => path.resolve(d)))];
+  const found = [];
+  for (const config of configs) {
+    const cache = path.join(config, 'plugins', 'cache');
+    for (const market of subdirs(cache)) {
+      const plug = path.join(cache, market, 'postman');
+      for (const version of subdirs(plug)) {
+        const p = path.join(plug, version, ...POSTMAN_PY);
+        if (isFile(p)) found.push({ p, version });
+      }
+    }
+  }
+  found.sort((a, b) => byVersion(b.version, a.version));
+  if (found.length) return found[0].p;
+  throw new Error('search needs the postman plugin, which is not installed. Install it with '
+    + '`/plugin install postman@logical-tools` (Claude Code) or `codex plugin add postman@logical-tools` '
+    + '(Codex), or set POSTMAN_PY to a postman.py. Nothing was read or sent.');
+}
 
 // --query is Gmail's own search (X-GM-RAW). --from is one sender's slice with text snippets.
 export function postmanArgs({ identity, query, from, days }) {
@@ -190,7 +229,7 @@ export function postmanArgs({ identity, query, from, days }) {
 
 // Same shape as the other postman callers: stderr inherited so postman's own errors show, 2 = credentials and
 // 1 = IMAP carried on the thrown error's status.
-const runPostman = (args) => execFileSync('python', [POSTMAN, ...args], {
+const runPostman = (args) => execFileSync('python', [findPostman(), ...args], {
   encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'],
   timeout: 10 * 60 * 1000, maxBuffer: 64 * 1024 * 1024,
 });

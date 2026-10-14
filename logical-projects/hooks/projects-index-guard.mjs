@@ -27,15 +27,49 @@ const GUARDED = [/(^|\/)docs\/projects\/INDEX\.md$/i,
 const WRITE_TOOLS = new Set(['Write', 'Edit', 'MultiEdit', 'NotebookEdit']);
 
 export function decide(input) {
-  if (!input || !WRITE_TOOLS.has(input.tool_name)) return null;
-  const raw = input.tool_input && input.tool_input.file_path;
-  if (typeof raw !== 'string' || !raw) return null;
+  if (!input) return null;
+  let paths;
+  if (input.tool_name === 'apply_patch') {
+    // Native Edit/Write matchers retain apply_patch and put the patch in command. Mirror the
+    // native parser's header whitespace: StartedPatch/AddFile/DeleteFile trim both ends,
+    // UpdateFile trims only the end so indented header-like context stays narrative prose.
+    // Rust trim uses Unicode White_Space (including U+0085), not JavaScript's trim set.
+    const command = input.tool_input && input.tool_input.command;
+    if (typeof command !== 'string') return null;
+    paths = [];
+    let update = false;
+    let canMove = false;
+    for (const raw of command.split('\n')) {
+      const line = update ? raw.replace(/\p{White_Space}+$/u, '')
+        : raw.replace(/^\p{White_Space}+|\p{White_Space}+$/gu, '');
+      if (line === '*** End Patch') break;
+      const header = line.match(/^\*\*\* (Add File|Update File|Delete File): (.*)$/);
+      if (header) {
+        paths.push(header[2]);
+        update = header[1] === 'Update File';
+        canMove = update;
+      } else if (update) {
+        // A move is metadata only before the first Update chunk and only once.
+        if (canMove && line.startsWith('*** Move to: ')) {
+          paths.push(line.slice('*** Move to: '.length));
+        }
+        canMove = false;
+      }
+    }
+  } else {
+    if (!WRITE_TOOLS.has(input.tool_name)) return null;
+    const raw = input.tool_input && input.tool_input.file_path;
+    if (typeof raw !== 'string' || !raw) return null;
+    paths = [raw];
+  }
   // Separators alone are not enough: `${root}/` + `docs/projects/...` yields a double slash, and
   // `docs/projects/./INDEX.md` reaches the same file past an anchored regex. normalize collapses
   // both. It also rewrites a leading // to /, which keeps a UNC path denied because the regex
   // anchors on a segment boundary rather than on the start of the string.
-  const path = posix.normalize(raw.replace(/\\/g, '/'));
-  if (!GUARDED.some((re) => re.test(path))) return null;
+  if (!paths.some((raw) => {
+    const path = posix.normalize(raw.replace(/\\/g, '/'));
+    return GUARDED.some((re) => re.test(path));
+  })) return null;
   return {
     permissionDecision: 'deny',
     permissionDecisionReason:

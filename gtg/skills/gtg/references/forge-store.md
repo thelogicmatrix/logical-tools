@@ -65,6 +65,16 @@ served stale.
 If the forge write fails during `handoff`, the body (read from stdin, so otherwise gone) is written to
 `docs/handoffs/current/<slug>.md`, uncommitted, and the command exits 1.
 
+Guarded handoffs (GTG >=4.8.1) pair `--expected-body-sha256 <64hex>` with
+`--expected-shelf active|backlog`. The caller hashes the exact UTF-8 handoff from
+`list --json`. GTG compares against its live loaded snapshot before any mutation,
+then uses that same snapshot's blob SHA for the write. A pre-comparison refusal,
+including a stale cache, exits 2 without a recovery body. Concurrent readback must
+still match the captured body and shelf before re-applying other-field changes;
+body/shelf changes and deletion remain conflicts. This does not reset the write
+baseline or permit an unguarded retry. Consumers must check `gtg --version` first,
+because older versions silently accept unknown handoff flags.
+
 ## Commands
 
 | Behaviour | Commands |
@@ -73,5 +83,6 @@ If the forge write fails during `handoff`, the body (read from stdin, so otherwi
 | Refused with a pointer to the store repo's history | `log`, `undo`, `stats`, `report`. They read git history of the file store, which the forge store does not write |
 | Unchanged | `help`, `progress` (still files under `docs/handoffs/progress/`), `--wip`, the after-handoff and after-resume hooks (same ctx, `file` is null) |
 
-`resume` does not fast-forward the hub from its git upstream on the forge store: the forge is already
-the shared copy.
+`resume` still fast-forwards the hub from its git upstream on the forge store, as it does on the file
+store. The records and handoffs come from the forge, but progress records and the portfolio rows the
+after-resume hook reads are files in the hub's git.
